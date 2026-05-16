@@ -8,6 +8,7 @@
     "experiment:turnstile": "ts-node src/experiments/turnstile-bypass.ts",
     "experiment:late-cdp": "ts-node src/experiments/late-cdp-attach.ts",
     "experiment:cdp-disconnect": "ts-node src/experiments/cdp-disconnect-login.ts",
+    "tools:gmail-token": "ts-node src/tools/get-gmail-token.ts",
     "dev": "nodemon --exec ts-node src/index.ts --ext ts",
     "build": "tsc",
     "typecheck": "tsc --noEmit"
@@ -22,6 +23,7 @@
     "chrome-cookies-secure": "3.0.2",
     "chrome-remote-interface": "0.34.0",
     "dotenv": "17.4.2",
+    "googleapis": "171.4.0",
     "http-proxy": "1.18.1",
     "nodemon": "3.1.14",
     "pino": "10.3.1",

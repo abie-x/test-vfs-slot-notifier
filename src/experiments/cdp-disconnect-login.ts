@@ -21,6 +21,7 @@ import { spawn } from 'child_process';
 
 // eslint-disable-next-line @typescript-eslint/no-require-imports
 const CDP = require('chrome-remote-interface');
+import { waitForOtp } from '../utils/gmail';
 
 const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
@@ -186,17 +187,169 @@ async function main(): Promise<void> {
     logger.warn('Please click Sign In manually');
   }
 
-  // ── Step 5: Wait for OTP ─────────────────────────────────────────────────
+  // ── Step 5: Wait for OTP screen and disconnect CDP ──────────────────────
   logger.info('');
   logger.info('════════════════════════════════════════════════════');
-  logger.info('  OTP sent to your email — enter it in the browser.');
-  logger.info('  Then navigate to booking page and select');
-  logger.info('  centre + category + sub-category.');
+  logger.info('  Waiting for OTP screen...');
+  logger.info('════════════════════════════════════════════════════');
+
+  // Wait for OTP screen to appear
+  logger.info('Waiting for OTP input field...');
+  let otpFieldFound = false;
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000);
+    const check = await Runtime.evaluate({
+      expression: `
+        (() => {
+          const inputs = document.querySelectorAll('input');
+          const otpInput = Array.from(inputs).find(el =>
+            el.placeholder?.includes('*') ||
+            document.body.innerText.includes('one time password')
+          );
+          return !!otpInput;
+        })()
+      `,
+      returnByValue: true,
+    });
+    if (check.result?.value === true) {
+      otpFieldFound = true;
+      logger.info('✓ OTP screen detected');
+      break;
+    }
+  }
+
+  if (!otpFieldFound) {
+    logger.error('OTP screen not detected — login may have failed');
+    logger.error('Please check the browser and enter OTP manually if needed');
+    await waitForEnter('\n>>> Press ENTER after completing OTP manually <<<\n');
+  } else {
+    // ── Step 6: Disconnect CDP before OTP Turnstile ─────────────────────────
+    logger.info('Disconnecting CDP before OTP Turnstile renders...');
+    await client.close();
+    logger.info('✓ CDP disconnected — OTP Turnstile should pass now');
+    await sleep(5000); // give Turnstile time to complete
+
+    // ── Step 7: Fetch OTP from Gmail while CDP is disconnected ──────────────
+    logger.info('');
+    logger.info('════════════════════════════════════════════════════');
+    logger.info('  Fetching OTP from Gmail...');
+    logger.info('  (checking Gmail API automatically)');
+    logger.info('════════════════════════════════════════════════════');
+
+    const otp = await waitForOtp(2 * 60 * 1000);
+
+    if (!otp) {
+      logger.error('Could not get OTP from Gmail — please enter it manually');
+      await waitForEnter('\n>>> Enter OTP manually in browser, then press ENTER <<<\n');
+    } else {
+      // ── Step 8: Reconnect CDP to fill OTP ────────────────────────────────
+      logger.info('Reconnecting CDP to fill OTP...');
+      client = await connectCDP('vfsglobal.com');
+      ({ Runtime } = client);
+      await client.Runtime.enable();
+
+      // Fill OTP field using Angular native setter
+      logger.info({ otp }, 'Filling OTP...');
+      const fillResult = await Runtime.evaluate({
+        expression: `
+          (async () => {
+            const inputs = document.querySelectorAll('input');
+            const otpInput = Array.from(inputs).find(el =>
+              el.placeholder?.includes('*') ||
+              el.type === 'password' ||
+              el.type === 'text'
+            );
+            if (!otpInput) return { ok: false, error: 'OTP input not found' };
+            const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+            setter?.call(otpInput, ${JSON.stringify(otp)});
+            otpInput.dispatchEvent(new Event('input', { bubbles: true }));
+            await new Promise(r => setTimeout(r, 500));
+            return { ok: true, value: otpInput.value };
+          })()
+        `,
+        awaitPromise: true,
+        returnByValue: true,
+      });
+      logger.info({ result: fillResult.result?.value }, '✓ OTP filled');
+
+      // ── Step 9: Disconnect CDP again before submit button Turnstile ─────
+      logger.info('Disconnecting CDP before submit button Turnstile...');
+      await client.close();
+      logger.info('✓ CDP disconnected — submit Turnstile should pass now');
+      await sleep(5000); // give Turnstile time to complete
+
+      // ── Step 10: Reconnect CDP and click submit ─────────────────────────
+      logger.info('Reconnecting CDP to click submit...');
+      client = await connectCDP('vfsglobal.com');
+      ({ Runtime } = client);
+      await client.Runtime.enable();
+
+      logger.info('Clicking Sign In button...');
+      let submitClicked = false;
+      for (let i = 0; i < 30; i++) {
+        await sleep(1000);
+        const btnResult = await Runtime.evaluate({
+          expression: `
+            (() => {
+              const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+              if (!btn) return { found: false };
+              const disabled = btn.hasAttribute('disabled');
+              if (!disabled) btn.click();
+              return { found: true, disabled, clicked: !disabled };
+            })()
+          `,
+          returnByValue: true,
+        });
+        const btn = btnResult.result?.value as { found: boolean; disabled: boolean; clicked: boolean } | null;
+        logger.info(`[${i + 1}/30] Submit button: ${btn?.found ? (btn.disabled ? 'disabled' : '✓ clicked') : 'not found'}`);
+        if (btn?.clicked) {
+          submitClicked = true;
+          logger.info('✓ Submit button clicked');
+          break;
+        }
+      }
+
+      if (!submitClicked) {
+        logger.warn('Could not click submit — Turnstile may have failed');
+        logger.warn('Please click submit manually');
+      }
+    }
+  }
+
+  // ── Step 11: Wait for redirect to dashboard ─────────────────────────────
+  logger.info('Waiting for login to complete...');
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000);
+    try {
+      const urlCheck = await Runtime.evaluate({ expression: 'location.pathname', returnByValue: true });
+      const path = String(urlCheck.result?.value ?? '');
+      if (!path.includes('/login')) {
+        logger.info({ path }, '✓ Login complete — redirected away from login');
+        break;
+      }
+    } catch (err) {
+      // CDP might be disconnected, try to reconnect
+      if (i % 5 === 0) {
+        try {
+          client = await connectCDP('vfsglobal.com');
+          ({ Runtime } = client);
+          await client.Runtime.enable();
+        } catch { /* retry */ }
+      }
+    }
+  }
+
+  // ── Step 12: Navigate to booking page and start polling ─────────────────
+  logger.info('');
+  logger.info('════════════════════════════════════════════════════');
+  logger.info('  Please navigate to booking page and select:');
+  logger.info('  1. Application Centre');
+  logger.info('  2. Appointment Category');
+  logger.info('  3. Sub-category (any option)');
+  logger.info('  4. Wait for earliest slot to appear');
   logger.info('════════════════════════════════════════════════════');
 
   await waitForEnter('\n>>> Press ENTER when earliest slot is visible <<<\n');
-
-  // ── Step 6: Start polling ────────────────────────────────────────────────
   const { Network, Runtime: Runtime3 } = client;
   await Network.enable();
   await Runtime3.enable();
