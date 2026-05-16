@@ -107,19 +107,32 @@ async function main(): Promise<void> {
   const chromeProc = spawn(CHROME_EXECUTABLE, [
     `--user-data-dir=${POLL_USER_DATA_DIR}`,
     `--remote-debugging-port=${REMOTE_DEBUG_PORT}`,
-    'about:blank',
+    VFS_LOGIN_URL,
   ], { detached: false, stdio: 'ignore' });
   await sleep(3000);
 
-  // ── Step 2: Connect CDP + navigate + fill credentials ───────────────────
+  // ── Step 2: Connect CDP and navigate to VFS login ───────────────────────
   logger.info('Connecting CDP...');
   let client = await connectCDP();
   let { Page, Runtime } = client;
   await Page.enable();
   await Runtime.enable();
 
+  // Navigate to VFS login (in case we're on chrome:// page)
   logger.info('Navigating to VFS login...');
   await Page.navigate({ url: VFS_LOGIN_URL });
+  await sleep(3000);
+
+  // Dismiss cookie banner immediately
+  logger.info('Dismissing cookie banner...');
+  await Runtime.evaluate({
+    expression: `
+      const btn = Array.from(document.querySelectorAll('button'))
+        .find(b => b.textContent.trim() === 'Accept All Cookies');
+      if (btn) btn.click();
+    `,
+  });
+  await sleep(1000);
 
   // Wait for form
   logger.info('Waiting for login form...');
@@ -158,7 +171,7 @@ async function main(): Promise<void> {
   logger.info('Disconnecting CDP before Turnstile renders...');
   await client.close();
   logger.info('✓ CDP disconnected — Turnstile should pass now');
-  await sleep(5000); // give Turnstile time to complete
+  await sleep(7000); // Wait for Turnstile to render and complete
 
   // ── Step 4: Reconnect CDP + wait for Sign In button + click ─────────────
   logger.info('Reconnecting CDP...');
@@ -185,6 +198,136 @@ async function main(): Promise<void> {
     const btn = btnResult.result?.value as { found: boolean; disabled: boolean; clicked: boolean } | null;
     logger.info(`[${i + 1}/30] Sign In: ${btn?.found ? (btn.disabled ? 'disabled' : '✓ clicked') : 'not found'}`);
     if (btn?.clicked) { clicked = true; logger.info('✓ Sign In button clicked'); break; }
+    
+    // After 7 attempts (7 seconds), check if Turnstile is the issue
+    if (i === 6 && btn?.disabled) {
+      logger.warn('Sign In button still disabled after 7s — checking Login Turnstile...');
+      const loginTurnstileCheck = await Runtime.evaluate({
+        expression: `
+          (() => {
+            const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+            const iframe = document.querySelector('iframe[src*="turnstile"]');
+            return {
+              checkboxFound: !!checkbox,
+              checkboxChecked: checkbox?.checked || false,
+              iframeFound: !!iframe,
+              turnstileVisible: !!document.querySelector('[id*="turnstile"], [class*="turnstile"]')
+            };
+          })()
+        `,
+        returnByValue: true,
+      });
+      const loginTs = loginTurnstileCheck.result?.value as any;
+      logger.info({ loginTurnstileStatus: loginTs }, 'Login Turnstile check result');
+      
+      // If Turnstile is visible but not checked, try to click the checkbox
+      if (loginTs?.turnstileVisible && !loginTs?.checkboxChecked) {
+        logger.warn('Login Turnstile not checked — attempting to click checkbox...');
+        
+        // Try to click the Turnstile checkbox
+        const clickResult = await Runtime.evaluate({
+          expression: `
+            (() => {
+              // Try to find and click the Turnstile checkbox
+              const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+              if (checkbox) {
+                checkbox.click();
+                return { clicked: true, method: 'checkbox' };
+              }
+              
+              // Fallback: try to click the Turnstile iframe or container
+              const turnstileContainer = document.querySelector('[id*="turnstile"], [class*="turnstile"]');
+              if (turnstileContainer) {
+                turnstileContainer.click();
+                return { clicked: true, method: 'container' };
+              }
+              
+              return { clicked: false };
+            })()
+          `,
+          returnByValue: true,
+        });
+        const clickRes = clickResult.result?.value as any;
+        logger.info({ clickResult: clickRes }, 'Checkbox click attempt');
+        
+        // Wait for Turnstile to process the click
+        logger.info('Waiting 5s for Turnstile to process...');
+        await sleep(5000);
+        
+        // Check if Sign In button is now enabled (the real indicator of Turnstile success)
+        const recheckResult = await Runtime.evaluate({
+          expression: `
+            (() => {
+              const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+              return {
+                buttonFound: !!btn,
+                buttonEnabled: btn && !btn.hasAttribute('disabled')
+              };
+            })()
+          `,
+          returnByValue: true,
+        });
+        const recheckTs = recheckResult.result?.value as any;
+        logger.info({ recheckStatus: recheckTs }, 'Sign In button recheck after click');
+        
+        // If button still disabled after clicking, reload
+        if (!recheckTs?.buttonEnabled) {
+          logger.warn('Sign In button still disabled after clicking — reloading page...');
+          await client.close();
+          await sleep(2000);
+          
+          // Reconnect and reload
+          logger.info('Reconnecting CDP to reload page...');
+          client = await connectCDP('vfsglobal.com');
+          ({ Page, Runtime } = client);
+          await Page.enable();
+          await Runtime.enable();
+          
+          logger.info('Reloading login page...');
+          await Page.navigate({ url: VFS_LOGIN_URL });
+          await sleep(3000);
+          
+          // Re-fill credentials
+          logger.info('Re-filling credentials after reload...');
+          const refillResult = await Runtime.evaluate({
+            expression: `
+              (async () => {
+                const email = document.querySelector('#email');
+                const pass  = document.querySelector('#password');
+                if (!email || !pass) return { ok: false, error: 'Fields not found' };
+                const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                setter?.call(email, ${JSON.stringify(email)});
+                email.dispatchEvent(new Event('input', { bubbles: true }));
+                await new Promise(r => setTimeout(r, 300));
+                setter?.call(pass, ${JSON.stringify(password)});
+                pass.dispatchEvent(new Event('input', { bubbles: true }));
+                return { ok: true };
+              })()
+            `,
+            awaitPromise: true, returnByValue: true, timeout: 10_000,
+          });
+          logger.info({ result: refillResult.result?.value }, 'Re-fill result');
+          
+          // Disconnect for login Turnstile
+          logger.info('Disconnecting CDP for login Turnstile (retry)...');
+          await client.close();
+          await sleep(7000);
+          
+          // Reconnect
+          logger.info('Reconnecting CDP after retry...');
+          client = await connectCDP('vfsglobal.com');
+          ({ Runtime } = client);
+          await client.Runtime.enable();
+          
+          // Reset loop to try Sign In button again
+          i = -1; // Will become 0 on next iteration
+          continue;
+        } else {
+          logger.info('✓ Sign In button enabled — Turnstile passed successfully');
+          // Continue with the loop, button should be enabled now
+        }
+      }
+    }
   }
 
   if (!clicked) {
@@ -232,7 +375,7 @@ async function main(): Promise<void> {
     logger.info('Disconnecting CDP before OTP Turnstile renders...');
     await client.close();
     logger.info('✓ CDP disconnected — OTP Turnstile should pass now');
-    await sleep(5000); // give Turnstile time to complete
+    await sleep(8000); // Give Turnstile more time to render and complete (increased from 5s)
 
     // ── Step 7: Fetch OTP from Gmail while CDP is disconnected ──────────────
     logger.info('');
@@ -281,7 +424,7 @@ async function main(): Promise<void> {
       logger.info('Disconnecting CDP before submit button Turnstile...');
       await client.close();
       logger.info('✓ CDP disconnected — submit Turnstile should pass now');
-      await sleep(5000); // give Turnstile time to complete
+      await sleep(8000); // Give Turnstile more time to render and complete (increased from 5s)
 
       // ── Step 10: Reconnect CDP and click submit ─────────────────────────
       logger.info('Reconnecting CDP to click submit...');
@@ -311,6 +454,207 @@ async function main(): Promise<void> {
           submitClicked = true;
           logger.info('✓ Submit button clicked');
           break;
+        }
+        
+        // After 7 attempts (7 seconds), check if Turnstile is the issue
+        if (i === 6 && btn?.disabled) {
+          logger.warn('Submit button still disabled after 7s — checking OTP Turnstile...');
+          const otpTurnstileCheck = await Runtime.evaluate({
+            expression: `
+              (() => {
+                const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+                const iframe = document.querySelector('iframe[src*="turnstile"]');
+                return {
+                  checkboxFound: !!checkbox,
+                  checkboxChecked: checkbox?.checked || false,
+                  iframeFound: !!iframe,
+                  turnstileVisible: !!document.querySelector('[id*="turnstile"], [class*="turnstile"]')
+                };
+              })()
+            `,
+            returnByValue: true,
+          });
+          const otpTs = otpTurnstileCheck.result?.value as any;
+          logger.info({ otpTurnstileStatus: otpTs }, 'OTP Turnstile check result');
+          
+          // If Turnstile is visible but not checked, try to click the checkbox
+          if (otpTs?.turnstileVisible && !otpTs?.checkboxChecked) {
+            logger.warn('OTP Turnstile not checked — attempting to click checkbox...');
+            
+            // Try to click the Turnstile checkbox
+            const clickResult = await Runtime.evaluate({
+              expression: `
+                (() => {
+                  // Try to find and click the Turnstile checkbox
+                  const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+                  if (checkbox) {
+                    checkbox.click();
+                    return { clicked: true, method: 'checkbox' };
+                  }
+                  
+                  // Fallback: try to click the Turnstile iframe or container
+                  const turnstileContainer = document.querySelector('[id*="turnstile"], [class*="turnstile"]');
+                  if (turnstileContainer) {
+                    turnstileContainer.click();
+                    return { clicked: true, method: 'container' };
+                  }
+                  
+                  return { clicked: false };
+                })()
+              `,
+              returnByValue: true,
+            });
+            const clickRes = clickResult.result?.value as any;
+            logger.info({ clickResult: clickRes }, 'Checkbox click attempt');
+            
+            // Wait for Turnstile to process the click
+            logger.info('Waiting 5s for Turnstile to process...');
+            await sleep(5000);
+            
+            // Check if Submit button is now enabled (the real indicator of Turnstile success)
+            const recheckResult = await Runtime.evaluate({
+              expression: `
+                (() => {
+                  const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+                  return {
+                    buttonFound: !!btn,
+                    buttonEnabled: btn && !btn.hasAttribute('disabled')
+                  };
+                })()
+              `,
+              returnByValue: true,
+            });
+            const recheckTs = recheckResult.result?.value as any;
+            logger.info({ recheckStatus: recheckTs }, 'Submit button recheck after click');
+            
+            // If button still disabled after clicking, reload
+            if (!recheckTs?.buttonEnabled) {
+              logger.warn('Submit button still disabled after clicking — reloading page...');
+              await client.close();
+              await sleep(2000);
+              
+              // Reconnect and reload
+              logger.info('Reconnecting CDP to reload page...');
+              client = await connectCDP('vfsglobal.com');
+              ({ Page, Runtime } = client);
+              await Page.enable();
+              await Runtime.enable();
+              
+              logger.info('Reloading login page...');
+              await Page.navigate({ url: VFS_LOGIN_URL });
+              await sleep(3000);
+              
+              // Re-fill credentials
+              logger.info('Re-filling credentials after reload...');
+              const refillResult = await Runtime.evaluate({
+                expression: `
+                  (async () => {
+                    const email = document.querySelector('#email');
+                    const pass  = document.querySelector('#password');
+                    if (!email || !pass) return { ok: false, error: 'Fields not found' };
+                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                    setter?.call(email, ${JSON.stringify(email)});
+                    email.dispatchEvent(new Event('input', { bubbles: true }));
+                    await new Promise(r => setTimeout(r, 300));
+                    setter?.call(pass, ${JSON.stringify(password)});
+                    pass.dispatchEvent(new Event('input', { bubbles: true }));
+                    return { ok: true };
+                  })()
+                `,
+                awaitPromise: true, returnByValue: true, timeout: 10_000,
+              });
+              logger.info({ result: refillResult.result?.value }, 'Re-fill result');
+              
+              // Disconnect for login Turnstile
+              logger.info('Disconnecting CDP for login Turnstile (retry)...');
+              await client.close();
+              await sleep(8000);
+              
+              // Reconnect and click Sign In
+              logger.info('Reconnecting CDP...');
+              client = await connectCDP('vfsglobal.com');
+              ({ Runtime } = client);
+              await client.Runtime.enable();
+              
+              // Click Sign In
+              for (let j = 0; j < 10; j++) {
+                await sleep(1000);
+                const signInResult = await Runtime.evaluate({
+                  expression: `
+                    (() => {
+                      const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+                      if (!btn) return { found: false };
+                      const disabled = btn.hasAttribute('disabled');
+                      if (!disabled) btn.click();
+                      return { found: true, disabled, clicked: !disabled };
+                    })()
+                  `,
+                  returnByValue: true,
+                });
+                const signInBtn = signInResult.result?.value as { found: boolean; disabled: boolean; clicked: boolean } | null;
+                if (signInBtn?.clicked) {
+                  logger.info('✓ Sign In clicked after reload');
+                  break;
+                }
+              }
+              
+              // Wait for OTP screen again
+              await sleep(3000);
+              
+              // Disconnect for OTP Turnstile
+              logger.info('Disconnecting CDP for OTP Turnstile (retry)...');
+              await client.close();
+              await sleep(8000);
+              
+              // Note: OTP already fetched, reuse it
+              logger.info('Reconnecting CDP to fill OTP (retry)...');
+              client = await connectCDP('vfsglobal.com');
+              ({ Runtime } = client);
+              await client.Runtime.enable();
+              
+              // Re-fill OTP
+              logger.info({ otp }, 'Re-filling OTP after reload...');
+              await Runtime.evaluate({
+                expression: `
+                  (async () => {
+                    const inputs = document.querySelectorAll('input');
+                    const otpInput = Array.from(inputs).find(el =>
+                      el.placeholder?.includes('*') ||
+                      el.type === 'password' ||
+                      el.type === 'text'
+                    );
+                    if (!otpInput) return false;
+                    const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+                    setter?.call(otpInput, ${JSON.stringify(otp)});
+                    otpInput.dispatchEvent(new Event('input', { bubbles: true }));
+                    await new Promise(r => setTimeout(r, 500));
+                    return true;
+                  })()
+                `,
+                awaitPromise: true,
+                returnByValue: true,
+              });
+              logger.info('✓ OTP re-filled');
+              
+              // Disconnect for submit Turnstile
+              logger.info('Disconnecting CDP for submit Turnstile (retry)...');
+              await client.close();
+              await sleep(8000);
+              
+              // Reconnect and try submit again
+              logger.info('Reconnecting CDP to click submit (retry)...');
+              client = await connectCDP('vfsglobal.com');
+              ({ Runtime } = client);
+              await client.Runtime.enable();
+              
+              // Reset loop to try submit button again
+              i = -1; // Will become 0 on next iteration
+              continue;
+            } else {
+              logger.info('✓ Submit button enabled — Turnstile passed successfully');
+              // Continue with the loop, button should be enabled now
+            }
+          }
         }
       }
 
@@ -344,17 +688,204 @@ async function main(): Promise<void> {
     }
   }
 
-  // ── Step 12: Navigate to booking page and start polling ─────────────────
+  // ── Step 12: Dismiss Chrome password save dialog ────────────────────────
+  logger.info('Checking for Chrome password save dialog...');
+  await sleep(2000); // Wait for dialog to appear
+  
+  // Try to dismiss the password save dialog (Chrome native dialog)
+  // This is a browser-level dialog, not a DOM element, so we'll use keyboard
+  await Runtime.evaluate({
+    expression: `
+      (() => {
+        // Press Escape key to dismiss any overlays
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+        return true;
+      })()
+    `,
+    returnByValue: true,
+  });
+  
+  logger.info('✓ Attempted to dismiss password dialog (Escape key)');
+  await sleep(1000);
+
+  // ── Step 13: Click "Start New Booking" button ───────────────────────────
+  logger.info('Looking for "Start New Booking" button...');
+  let bookingClicked = false;
+  
+  for (let i = 0; i < 20; i++) {
+    await sleep(1000);
+    const result = await Runtime.evaluate({
+      expression: `
+        (() => {
+          // Primary: Look for "Start New Booking" text
+          const buttons = Array.from(document.querySelectorAll('button, a, [role="button"]'));
+          const bookingBtn = buttons.find(btn => {
+            const text = btn.textContent?.toLowerCase() || '';
+            return text.includes('start new booking');
+          });
+          
+          if (bookingBtn) {
+            bookingBtn.click();
+            return { found: true, text: bookingBtn.textContent?.trim(), method: 'text' };
+          }
+          
+          // Fallback: Look for orange button with "booking" text
+          const orangeBtn = document.querySelector('button[class*="orange"], a[class*="orange"]');
+          if (orangeBtn && orangeBtn.textContent?.toLowerCase().includes('booking')) {
+            orangeBtn.click();
+            return { found: true, text: orangeBtn.textContent?.trim(), method: 'orange-fallback' };
+          }
+          
+          return { found: false };
+        })()
+      `,
+      returnByValue: true,
+    });
+    
+    const btn = result.result?.value as { found: boolean; text?: string; method?: string } | null;
+    if (btn?.found) {
+      logger.info({ buttonText: btn.text, method: btn.method }, '✓ "Start New Booking" button clicked');
+      bookingClicked = true;
+      break;
+    }
+    
+    if (i % 5 === 0) {
+      logger.info(`[${i + 1}/20] Waiting for "Start New Booking" button...`);
+    }
+  }
+
+  if (!bookingClicked) {
+    logger.warn('Could not find "Start New Booking" button automatically');
+    logger.warn('Please click it manually');
+  } else {
+    // Wait for booking page to load
+    logger.info('Waiting for booking page to load...');
+    await sleep(3000);
+    
+    // Verify we're on the booking page
+    const urlCheck = await Runtime.evaluate({ expression: 'location.href', returnByValue: true });
+    logger.info({ url: urlCheck.result?.value }, '✓ Navigated to booking page');
+  }
+
+  // ── Step 14: Automate booking page setup ────────────────────────────────
   logger.info('');
   logger.info('════════════════════════════════════════════════════');
-  logger.info('  Please navigate to booking page and select:');
-  logger.info('  1. Application Centre');
-  logger.info('  2. Appointment Category');
-  logger.info('  3. Sub-category (any option)');
-  logger.info('  4. Wait for earliest slot to appear');
+  logger.info('  Automating booking page setup...');
   logger.info('════════════════════════════════════════════════════');
 
-  await waitForEnter('\n>>> Press ENTER when earliest slot is visible <<<\n');
+  // Wait for booking page to fully load
+  await sleep(2000);
+
+  // Step 14a: Select Application Centre (Mangalore)
+  logger.info('Selecting Application Centre: Mangalore...');
+  const centreResult = await Runtime.evaluate({
+    expression: `
+      (async () => {
+        try {
+          // Find the Application Centre dropdown (first mat-select)
+          const selects = document.querySelectorAll('mat-select');
+          if (selects.length < 1) return { ok: false, error: 'Centre dropdown not found' };
+          
+          const centreSelect = selects[0];
+          centreSelect.click();
+          await new Promise(r => setTimeout(r, 1000));
+          
+          // Find Mangalore option
+          const options = document.querySelectorAll('mat-option');
+          const mangaloreOption = Array.from(options).find(opt => 
+            opt.textContent?.includes('Mangalore')
+          );
+          
+          if (!mangaloreOption) return { ok: false, error: 'Mangalore option not found' };
+          
+          mangaloreOption.click();
+          await new Promise(r => setTimeout(r, 1000));
+          return { ok: true, selected: mangaloreOption.textContent?.trim() };
+        } catch(e) {
+          return { ok: false, error: String(e) };
+        }
+      })()
+    `,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: 15_000,
+  });
+  
+  const centreRes = centreResult.result?.value as { ok: boolean; selected?: string; error?: string };
+  if (centreRes?.ok) {
+    logger.info({ centre: centreRes.selected }, '✓ Application Centre selected');
+  } else {
+    logger.warn({ error: centreRes?.error }, 'Failed to select centre — may already be selected');
+  }
+
+  // Step 14b: Wait for Appointment Category to auto-populate
+  logger.info('Waiting for Appointment Category to auto-populate...');
+  await sleep(3000);
+  
+  const categoryCheck = await Runtime.evaluate({
+    expression: `
+      (() => {
+        const selects = document.querySelectorAll('mat-select');
+        if (selects.length < 2) return { found: false };
+        const categoryText = selects[1].textContent?.trim();
+        return { found: true, category: categoryText };
+      })()
+    `,
+    returnByValue: true,
+  });
+  const catRes = categoryCheck.result?.value as { found: boolean; category?: string };
+  logger.info({ category: catRes?.category }, '✓ Appointment Category auto-populated');
+
+  // Step 14c: Select first sub-category to trigger initial slot check
+  logger.info('Selecting first sub-category to load slots...');
+  const firstSubCatResult = await Runtime.evaluate({
+    expression: `
+      (async () => {
+        try {
+          const selects = document.querySelectorAll('mat-select');
+          if (selects.length < 3) return { ok: false, error: 'Sub-category dropdown not found' };
+          
+          selects[2].click();
+          await new Promise(r => setTimeout(r, 800));
+          
+          const options = document.querySelectorAll('mat-option');
+          const firstOption = Array.from(options).find(o => 
+            o.textContent?.trim().includes('Long Stay')
+          );
+          
+          if (!firstOption) return { ok: false, error: 'Long Stay option not found' };
+          
+          firstOption.click();
+          await new Promise(r => setTimeout(r, 500));
+          return { ok: true, selected: firstOption.textContent?.trim() };
+        } catch(e) {
+          return { ok: false, error: String(e) };
+        }
+      })()
+    `,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: 10_000,
+  });
+  
+  const firstSubRes = firstSubCatResult.result?.value as { ok: boolean; selected?: string; error?: string };
+  if (firstSubRes?.ok) {
+    logger.info({ subCategory: firstSubRes.selected }, '✓ First sub-category selected');
+  } else {
+    logger.error({ error: firstSubRes?.error }, 'Failed to select first sub-category');
+  }
+
+  // Wait for slot data to load
+  logger.info('Waiting for slot data to load...');
+  await sleep(3000);
+
+  logger.info('');
+  logger.info('════════════════════════════════════════════════════');
+  logger.info('  ✓ Booking page setup complete!');
+  logger.info('  Starting automated polling...');
+  logger.info('════════════════════════════════════════════════════');
+
+  // ── Step 15: Start polling loop ──────────────────────────────────────────
   const { Network, Runtime: Runtime3 } = client;
   await Network.enable();
   await Runtime3.enable();
