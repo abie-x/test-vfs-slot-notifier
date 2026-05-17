@@ -384,12 +384,292 @@ async function main(): Promise<void> {
     logger.info('  (checking Gmail API automatically)');
     logger.info('════════════════════════════════════════════════════');
 
-    const otp = await waitForOtp(2 * 60 * 1000);
+    let otp = await waitForOtp(2 * 60 * 1000);
 
     if (!otp) {
-      logger.error('Could not get OTP from Gmail — please enter it manually');
-      await waitForEnter('\n>>> Enter OTP manually in browser, then press ENTER <<<\n');
-    } else {
+      logger.warn('OTP not received within 2 minutes — waiting 2 more minutes...');
+      logger.info('(VFS sometimes delays OTP delivery)');
+      otp = await waitForOtp(2 * 60 * 1000);
+    }
+
+    if (!otp) {
+      logger.error('OTP still not received after 4 minutes total');
+      logger.error('This may indicate an issue with VFS OTP delivery');
+      logger.info('');
+      logger.info('Attempting to reload and retry...');
+      
+      // Reconnect CDP to reload
+      logger.info('Reconnecting CDP...');
+      client = await connectCDP('vfsglobal.com');
+      ({ Page, Runtime } = client);
+      await Page.enable();
+      await Runtime.enable();
+      
+      // Check which screen we're on
+      const screenCheck = await Runtime.evaluate({
+        expression: `
+          (() => {
+            const url = location.href;
+            const hasEmailField = !!document.querySelector('#email');
+            const hasOtpField = !!Array.from(document.querySelectorAll('input')).find(el =>
+              el.placeholder?.includes('*') || el.type === 'password'
+            );
+            const hasDashboard = url.includes('application-detail') || document.body.innerText.includes('Start New Booking');
+            
+            if (hasEmailField) return 'login';
+            if (hasOtpField) return 'otp';
+            if (hasDashboard) return 'dashboard';
+            return 'unknown';
+          })()
+        `,
+        returnByValue: true,
+      });
+      const currentScreen = String(screenCheck.result?.value ?? 'unknown');
+      logger.info({ screen: currentScreen }, 'Current screen detected');
+      
+      if (currentScreen === 'login') {
+        logger.info('On login screen — reloading page to retry...');
+        await Page.reload();
+        await sleep(3000);
+        
+        // Re-fill credentials and continue
+        logger.info('Re-filling credentials...');
+        await Runtime.evaluate({
+          expression: `
+            (async () => {
+              const email = document.querySelector('#email');
+              const pass  = document.querySelector('#password');
+              if (!email || !pass) return false;
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              setter?.call(email, ${JSON.stringify(email)});
+              email.dispatchEvent(new Event('input', { bubbles: true }));
+              await new Promise(r => setTimeout(r, 300));
+              setter?.call(pass, ${JSON.stringify(password)});
+              pass.dispatchEvent(new Event('input', { bubbles: true }));
+              return true;
+            })()
+          `,
+          awaitPromise: true,
+          returnByValue: true,
+        });
+        
+        // Disconnect for Turnstile
+        await client.close();
+        await sleep(7000);
+        
+        // Reconnect and click Sign In
+        client = await connectCDP('vfsglobal.com');
+        ({ Runtime } = client);
+        await Runtime.enable();
+        
+        // Wait for and click Sign In
+        for (let i = 0; i < 10; i++) {
+          await sleep(1000);
+          const clicked = await Runtime.evaluate({
+            expression: `
+              (() => {
+                const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+                if (btn && !btn.hasAttribute('disabled')) {
+                  btn.click();
+                  return true;
+                }
+                return false;
+              })()
+            `,
+            returnByValue: true,
+          });
+          if (clicked.result?.value === true) {
+            logger.info('✓ Sign In clicked after reload');
+            break;
+          }
+        }
+        
+        // Wait for OTP screen
+        await sleep(3000);
+        await client.close();
+        await sleep(8000);
+        
+        // Try fetching OTP again
+        logger.info('Fetching OTP again after reload...');
+        otp = await waitForOtp(2 * 60 * 1000);
+      } else if (currentScreen === 'otp') {
+        logger.info('Still on OTP screen — reloading page (will go to login)...');
+        await Page.reload();
+        await sleep(3000);
+        
+        logger.info('Reloaded to login screen — starting full login process again...');
+        
+        // Dismiss cookie banner
+        await Runtime.evaluate({
+          expression: `
+            const btn = Array.from(document.querySelectorAll('button'))
+              .find(b => b.textContent.trim() === 'Accept All Cookies');
+            if (btn) btn.click();
+          `,
+        });
+        await sleep(1000);
+        
+        // Wait for form
+        logger.info('Waiting for login form...');
+        for (let i = 0; i < 10; i++) {
+          await sleep(1000);
+          const check = await Runtime.evaluate({
+            expression: '!!document.querySelector("#email") && !!document.querySelector("#password")',
+            returnByValue: true,
+          });
+          if (check.result?.value === true) break;
+        }
+        
+        // Fill credentials
+        logger.info('Filling credentials...');
+        await Runtime.evaluate({
+          expression: `
+            (async () => {
+              const email = document.querySelector('#email');
+              const pass  = document.querySelector('#password');
+              if (!email || !pass) return false;
+              const setter = Object.getOwnPropertyDescriptor(HTMLInputElement.prototype, 'value')?.set;
+              setter?.call(email, ${JSON.stringify(email)});
+              email.dispatchEvent(new Event('input', { bubbles: true }));
+              await new Promise(r => setTimeout(r, 300));
+              setter?.call(pass, ${JSON.stringify(password)});
+              pass.dispatchEvent(new Event('input', { bubbles: true }));
+              return true;
+            })()
+          `,
+          awaitPromise: true,
+          returnByValue: true,
+        });
+        
+        // Disconnect for login Turnstile
+        logger.info('Disconnecting CDP for login Turnstile...');
+        await client.close();
+        await sleep(7000);
+        
+        // Reconnect and wait for Sign In button
+        logger.info('Reconnecting CDP...');
+        client = await connectCDP('vfsglobal.com');
+        ({ Runtime } = client);
+        await Runtime.enable();
+        
+        // Wait for and click Sign In (EXACT same logic as initial login)
+        logger.info('Waiting for Sign In button...');
+        let signInClicked = false;
+        for (let i = 0; i < 30; i++) {
+          await sleep(1000);
+          const btnResult = await Runtime.evaluate({
+            expression: `
+              (() => {
+                const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+                if (!btn) return { found: false };
+                const disabled = btn.hasAttribute('disabled');
+                if (!disabled) btn.click();
+                return { found: true, disabled, clicked: !disabled };
+              })()
+            `,
+            returnByValue: true,
+          });
+          const btn = btnResult.result?.value as { found: boolean; disabled: boolean; clicked: boolean } | null;
+          
+          if (btn?.clicked) {
+            signInClicked = true;
+            logger.info('✓ Sign In clicked');
+            break;
+          }
+          
+          // After 7 seconds, check Turnstile if button still disabled
+          if (i === 6 && btn?.disabled) {
+            logger.warn('Sign In still disabled — checking Turnstile...');
+            const tsCheck = await Runtime.evaluate({
+              expression: `
+                (() => {
+                  const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+                  const iframe = document.querySelector('iframe[src*="turnstile"]');
+                  return {
+                    checkboxFound: !!checkbox,
+                    checkboxChecked: checkbox?.checked || false,
+                    iframeFound: !!iframe,
+                    turnstileVisible: !!document.querySelector('[id*="turnstile"], [class*="turnstile"]')
+                  };
+                })()
+              `,
+              returnByValue: true,
+            });
+            const loginTs = tsCheck.result?.value as any;
+            
+            if (loginTs?.turnstileVisible && !loginTs?.checkboxChecked) {
+              logger.warn('Turnstile not checked — clicking checkbox...');
+              await Runtime.evaluate({
+                expression: `
+                  (() => {
+                    const checkbox = document.querySelector('input[type="checkbox"][name*="cf-turnstile"], input[type="checkbox"][id*="turnstile"]');
+                    if (checkbox) {
+                      checkbox.click();
+                      return { clicked: true, method: 'checkbox' };
+                    }
+                    const turnstileContainer = document.querySelector('[id*="turnstile"], [class*="turnstile"]');
+                    if (turnstileContainer) {
+                      turnstileContainer.click();
+                      return { clicked: true, method: 'container' };
+                    }
+                    return { clicked: false };
+                  })()
+                `,
+              });
+              
+              logger.info('Waiting 5s for Turnstile to process...');
+              await sleep(5000);
+              
+              // Check if button is now enabled
+              const recheckResult = await Runtime.evaluate({
+                expression: `
+                  (() => {
+                    const btn = document.querySelector('button.btn-brand-orange, button[type="submit"]');
+                    return {
+                      buttonFound: !!btn,
+                      buttonEnabled: btn && !btn.hasAttribute('disabled')
+                    };
+                  })()
+                `,
+                returnByValue: true,
+              });
+              const recheckTs = recheckResult.result?.value as any;
+              
+              if (!recheckTs?.buttonEnabled) {
+                logger.warn('Button still disabled after clicking checkbox');
+              } else {
+                logger.info('✓ Button enabled after clicking checkbox');
+              }
+            }
+          }
+        }
+        
+        if (!signInClicked) {
+          logger.error('Could not click Sign In after reload — stopping OTP fetch');
+          otp = null; // Don't try to fetch OTP if login failed
+        } else {
+          // Wait for OTP screen
+          logger.info('Waiting for OTP screen...');
+          await sleep(3000);
+          
+          // Disconnect for OTP Turnstile
+          logger.info('Disconnecting CDP for OTP Turnstile...');
+          await client.close();
+          await sleep(8000);
+          
+          // Try fetching OTP again
+          logger.info('Fetching OTP after full reload...');
+          otp = await waitForOtp(2 * 60 * 1000);
+        }
+      }
+      
+      if (!otp) {
+        logger.error('Could not get OTP after retry — manual entry required');
+        await waitForEnter('\n>>> Enter OTP manually in browser, then press ENTER <<<\n');
+      }
+    }
+    
+    if (otp) {
       // ── Step 8: Reconnect CDP to fill OTP ────────────────────────────────
       logger.info('Reconnecting CDP to fill OTP...');
       client = await connectCDP('vfsglobal.com');
@@ -775,6 +1055,50 @@ async function main(): Promise<void> {
 
   // Wait for booking page to fully load
   await sleep(2000);
+  
+  // Enable Network monitoring BEFORE selecting sub-category to capture first API call
+  const { Network, Runtime: Runtime3 } = client;
+  await Network.enable();
+  await Runtime3.enable();
+  
+  let pollCount = 0;
+  let lastEarliestDate: string | null = null;
+  const pending = new Map<string, number>();
+
+  // Set up Network listeners to capture ALL API calls (including the first one)
+  Network.requestWillBeSent((p: any) => {
+    if (!p.request?.url?.includes('CheckIsSlotAvailable')) return;
+    pending.set(p.requestId, 0);
+  });
+  Network.responseReceived((p: any) => {
+    if (!pending.has(p.requestId)) return;
+    pending.set(p.requestId, p.response?.status ?? 0);
+  });
+  Network.loadingFinished(async (p: any) => {
+    if (!pending.has(p.requestId)) return;
+    const status = pending.get(p.requestId)!;
+    pending.delete(p.requestId);
+
+    try {
+      const resp = await Network.getResponseBody({ requestId: p.requestId });
+      const data = JSON.parse(resp.body);
+      pollCount++;
+      
+      // Response structure: { earliestDate: "05/30/2026 00:00:00", earliestSlotLists: [...] }
+      const earliestDate = data?.earliestDate ?? 'N/A';
+      const slots = data?.earliestSlotLists?.length ?? 0;
+      
+      const now = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: true });
+      logger.info(`[${now}] Poll #${pollCount} — earliestDate: ${earliestDate} | status: ${status} | slots: ${slots}`);
+
+      if (earliestDate !== lastEarliestDate && lastEarliestDate !== null && earliestDate !== 'N/A') {
+        logger.warn({ old: lastEarliestDate, new: earliestDate }, '⚠️  SLOT CHANGE DETECTED');
+      }
+      lastEarliestDate = earliestDate;
+    } catch (err: any) {
+      logger.warn({ err, request: p }, 'Failed to read response body');
+    }
+  });
 
   // Step 14a: Select Application Centre (Mangalore)
   logger.info('Selecting Application Centre: Mangalore...');
@@ -838,6 +1162,10 @@ async function main(): Promise<void> {
 
   // Step 14c: Select first sub-category to trigger initial slot check
   logger.info('Selecting first sub-category to load slots...');
+  
+  // Wait for sub-category options to load
+  await sleep(2000);
+  
   const firstSubCatResult = await Runtime.evaluate({
     expression: `
       (async () => {
@@ -845,15 +1173,20 @@ async function main(): Promise<void> {
           const selects = document.querySelectorAll('mat-select');
           if (selects.length < 3) return { ok: false, error: 'Sub-category dropdown not found' };
           
+          // Click to open dropdown
           selects[2].click();
-          await new Promise(r => setTimeout(r, 800));
+          await new Promise(r => setTimeout(r, 1500)); // Wait longer for options to load
           
           const options = document.querySelectorAll('mat-option');
           const firstOption = Array.from(options).find(o => 
             o.textContent?.trim().includes('Long Stay')
           );
           
-          if (!firstOption) return { ok: false, error: 'Long Stay option not found' };
+          if (!firstOption) {
+            // Log available options for debugging
+            const availableOptions = Array.from(options).map(o => o.textContent?.trim());
+            return { ok: false, error: 'Long Stay option not found', availableOptions };
+          }
           
           firstOption.click();
           await new Promise(r => setTimeout(r, 500));
@@ -868,11 +1201,11 @@ async function main(): Promise<void> {
     timeout: 10_000,
   });
   
-  const firstSubRes = firstSubCatResult.result?.value as { ok: boolean; selected?: string; error?: string };
+  const firstSubRes = firstSubCatResult.result?.value as { ok: boolean; selected?: string; error?: string; availableOptions?: string[] };
   if (firstSubRes?.ok) {
     logger.info({ subCategory: firstSubRes.selected }, '✓ First sub-category selected');
   } else {
-    logger.error({ error: firstSubRes?.error }, 'Failed to select first sub-category');
+    logger.warn({ error: firstSubRes?.error, availableOptions: firstSubRes?.availableOptions }, 'Could not select first sub-category — will start polling anyway');
   }
 
   // Wait for slot data to load
@@ -886,51 +1219,12 @@ async function main(): Promise<void> {
   logger.info('════════════════════════════════════════════════════');
 
   // ── Step 15: Start polling loop ──────────────────────────────────────────
-  const { Network, Runtime: Runtime3 } = client;
-  await Network.enable();
-  await Runtime3.enable();
-
   const urlCheck = await Runtime3.evaluate({ expression: 'location.href', returnByValue: true });
   logger.info({ url: urlCheck.result?.value }, '✓ Polling started on page');
 
-  let pollCount = 0;
-  let lastEarliestDate: string | null = null;
   let subCatIndex = 0;
-  const pending = new Map<string, number>();
 
-  Network.requestWillBeSent((p: any) => {
-    if (!p.request?.url?.includes('CheckIsSlotAvailable')) return;
-    pending.set(p.requestId, 0);
-  });
-  Network.responseReceived((p: any) => {
-    if (!pending.has(p.requestId)) return;
-    pending.set(p.requestId, p.response?.status ?? 0);
-  });
-  Network.loadingFinished(async (p: any) => {
-    if (!pending.has(p.requestId)) return;
-    const status = pending.get(p.requestId)!;
-    pending.delete(p.requestId);
-    try {
-      const r = await Network.getResponseBody({ requestId: p.requestId });
-      const parsed = JSON.parse(r.body ?? '{}');
-      pollCount++;
-      const earliestDate: string | null = parsed.earliestDate ?? null;
-      const slots = parsed.earliestSlotLists ?? [];
-      const changed = earliestDate !== lastEarliestDate && lastEarliestDate !== null;
-      if (changed) {
-        logger.info('════════════════════════════════════════════════════');
-        logger.info(`[${ts()}] ⚡ SLOT CHANGED: ${lastEarliestDate} → ${earliestDate}`);
-        slots.forEach((s: any, i: number) => logger.info(`  Slot ${i + 1}: ${s.date} — applicants: ${s.applicant}`));
-        logger.info('════════════════════════════════════════════════════');
-        // TODO Phase 6: Telegram notification here
-      } else {
-        logger.info(`[${ts()}] Poll #${pollCount} — earliestDate: ${earliestDate ?? 'none'} | status: ${status} | slots: ${slots.length}`);
-      }
-      lastEarliestDate = earliestDate;
-    } catch (err) { logger.warn({ err }, 'Failed to read response body'); }
-  });
-
-  // Wait for first natural response
+  // Wait for first natural response (from initial sub-category selection)
   await new Promise<void>((resolve) => {
     const check = setInterval(() => { if (pollCount > 0) { clearInterval(check); resolve(); } }, 500);
     setTimeout(() => { clearInterval(check); resolve(); }, 30_000);
