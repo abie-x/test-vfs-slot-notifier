@@ -4,10 +4,6 @@
   "main": "index.js",
   "scripts": {
     "start": "ts-node src/index.ts",
-    "login": "ts-node src/login.ts",
-    "experiment:turnstile": "ts-node src/experiments/turnstile-bypass.ts",
-    "experiment:late-cdp": "ts-node src/experiments/late-cdp-attach.ts",
-    "experiment:cdp-disconnect": "ts-node src/experiments/cdp-disconnect-login.ts",
     "tools:gmail-token": "ts-node src/tools/get-gmail-token.ts",
     "dev": "nodemon --exec ts-node src/index.ts --ext ts",
     "build": "tsc",

@@ -2,7 +2,4 @@ node_modules/
 dist/
 .env
 *.log
-user-data/
-user-data-login/
 user-data-poll/
-session.json

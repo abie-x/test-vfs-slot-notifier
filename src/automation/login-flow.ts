@@ -1,0 +1,241 @@
+/**
+ * Login Flow Automation
+ * Handles the complete VFS login process with Turnstile bypass
+ */
+
+import { logger } from '../utils/logger';
+import { waitForOtp } from '../utils/gmail';
+import {
+  CDPClient,
+  connectCDP,
+  sleep,
+  waitForLoginForm,
+  fillLoginCredentials,
+  checkButtonWithRetry,
+  waitForOTPField,
+  fillOTPField,
+} from './cdp-helpers';
+
+const BUTTON_SELECTOR = 'button.btn-brand-orange, button[type="submit"]';
+const TURNSTILE_WAIT_LOGIN = 7000;
+const TURNSTILE_WAIT_OTP = 8000;
+
+/**
+ * Perform login with credentials
+ */
+export async function performLogin(
+  client: CDPClient,
+  email: string,
+  password: string
+): Promise<CDPClient> {
+  const { Page, Runtime } = client;
+  
+  // Navigate to login page
+  logger.info('Navigating to VFS login...');
+  await Page.navigate({ url: 'https://visa.vfsglobal.com/ind/en/fra/login' });
+  await sleep(3000);
+  
+  // Wait for and fill form
+  await waitForLoginForm(Runtime);
+  await fillLoginCredentials(Runtime, email, password);
+  
+  // Disconnect for Turnstile
+  logger.info('Disconnecting CDP before Turnstile renders...');
+  await client.close();
+  logger.info('✓ CDP disconnected — Turnstile should pass now');
+  await sleep(TURNSTILE_WAIT_LOGIN);
+  
+  // Check Sign In button with retry
+  const { clicked, client: newClient } = await checkButtonWithRetry(
+    BUTTON_SELECTOR,
+    'Sign In',
+    5,
+    60,
+    7
+  );
+  
+  if (!clicked) {
+    logger.warn('Sign In button still disabled — attempting reload retry');
+    return await retryLoginWithReload(email, password);
+  }
+  
+  return newClient!;
+}
+
+/**
+ * Retry login with page reload
+ */
+async function retryLoginWithReload(email: string, password: string): Promise<CDPClient> {
+  logger.warn('Reloading page to retry (one time)...');
+  
+  const client = await connectCDP('vfsglobal.com');
+  const { Page, Runtime } = client;
+  await Page.enable();
+  await Runtime.enable();
+  
+  await Page.reload();
+  await sleep(3000);
+  
+  await waitForLoginForm(Runtime, 10);
+  await fillLoginCredentials(Runtime, email, password);
+  
+  await client.close();
+  await sleep(TURNSTILE_WAIT_LOGIN);
+  
+  const { clicked, client: newClient } = await checkButtonWithRetry(
+    BUTTON_SELECTOR,
+    'Sign In',
+    5,
+    60,
+    7
+  );
+  
+  if (!clicked) {
+    logger.error('Sign In still failed after reload — manual intervention required');
+    process.exit(1);
+  }
+  
+  return newClient!;
+}
+
+/**
+ * Handle OTP screen and submission
+ */
+export async function handleOTPScreen(client: CDPClient): Promise<CDPClient> {
+  const { Runtime } = client;
+  
+  logger.info('');
+  logger.info('════════════════════════════════════════════════════');
+  logger.info('  Waiting for OTP screen...');
+  logger.info('════════════════════════════════════════════════════');
+  
+  const otpFieldFound = await waitForOTPField(Runtime);
+  
+  if (!otpFieldFound) {
+    logger.error('OTP screen not detected — login may have failed');
+    throw new Error('OTP screen not found');
+  }
+  
+  // Disconnect for OTP Turnstile
+  logger.info('Disconnecting CDP before OTP Turnstile renders...');
+  await client.close();
+  logger.info('✓ CDP disconnected — OTP Turnstile should pass now');
+  await sleep(TURNSTILE_WAIT_OTP);
+  
+  // Fetch OTP from Gmail
+  const otp = await fetchOTPWithRetry();
+  
+  if (!otp) {
+    throw new Error('Could not fetch OTP');
+  }
+  
+  // Reconnect and fill OTP
+  logger.info('Reconnecting CDP to fill OTP...');
+  const newClient = await connectCDP('vfsglobal.com');
+  await newClient.Runtime.enable();
+  
+  await fillOTPField(newClient.Runtime, otp);
+  await sleep(2000); // Wait for Angular to process
+  
+  // Check Submit button with retry
+  const { clicked, client: finalClient } = await checkButtonWithRetry(
+    BUTTON_SELECTOR,
+    'Submit',
+    5,
+    60,
+    2
+  );
+  
+  if (!clicked) {
+    logger.warn('Submit button still disabled — attempting reload retry');
+    return await retryOTPSubmitWithReload(otp);
+  }
+  
+  return finalClient!;
+}
+
+/**
+ * Fetch OTP with retry logic
+ */
+async function fetchOTPWithRetry(): Promise<string | null> {
+  logger.info('');
+  logger.info('════════════════════════════════════════════════════');
+  logger.info('  Fetching OTP from Gmail...');
+  logger.info('  (checking Gmail API automatically)');
+  logger.info('════════════════════════════════════════════════════');
+  
+  let otp = await waitForOtp(2 * 60 * 1000);
+  
+  if (!otp) {
+    logger.warn('OTP not received within 2 minutes — waiting 2 more minutes...');
+    logger.info('(VFS sometimes delays OTP delivery)');
+    otp = await waitForOtp(2 * 60 * 1000);
+  }
+  
+  if (!otp) {
+    logger.error('OTP still not received after 4 minutes total');
+    logger.error('This may indicate an issue with VFS OTP delivery');
+  }
+  
+  return otp;
+}
+
+/**
+ * Retry OTP submit with reload
+ */
+async function retryOTPSubmitWithReload(otp: string): Promise<CDPClient> {
+  logger.warn('Reloading page to retry Submit (one time)...');
+  
+  const client = await connectCDP('vfsglobal.com');
+  const { Page, Runtime } = client;
+  await Page.enable();
+  await Runtime.enable();
+  
+  await Page.reload();
+  await sleep(3000);
+  
+  // Re-fill OTP
+  logger.info({ otp }, 'Re-filling OTP after reload...');
+  await fillOTPField(Runtime, otp);
+  await sleep(2000);
+  
+  // Try Submit again
+  const { clicked, client: newClient } = await checkButtonWithRetry(
+    BUTTON_SELECTOR,
+    'Submit',
+    5,
+    60,
+    2
+  );
+  
+  if (!clicked) {
+    logger.error('Submit still failed after reload — manual intervention required');
+    process.exit(1);
+  }
+  
+  return newClient!;
+}
+
+/**
+ * Wait for redirect away from login page
+ */
+export async function waitForLoginComplete(Runtime: any): Promise<void> {
+  logger.info('Waiting for login to complete...');
+  for (let i = 0; i < 30; i++) {
+    await sleep(1000);
+    try {
+      const urlCheck = await Runtime.evaluate({
+        expression: 'location.pathname',
+        returnByValue: true,
+      });
+      const path = String(urlCheck.result?.value ?? '');
+      if (!path.includes('/login')) {
+        logger.info({ path }, '✓ Login complete — redirected away from login');
+        return;
+      }
+    } catch {
+      // CDP might be disconnected, continue waiting
+    }
+  }
+  logger.warn('Login redirect timeout — may still be on login page');
+}
