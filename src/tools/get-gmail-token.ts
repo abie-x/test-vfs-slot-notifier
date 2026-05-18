@@ -1,4 +1,3 @@
-import 'dotenv/config';
 /**
  * One-time Gmail OAuth2 token generator.
  * Run this once to get a refresh token, then add it to .env.
@@ -6,6 +5,7 @@ import 'dotenv/config';
  * Usage: npm run tools:gmail-token
  */
 
+import 'dotenv/config';
 import * as readline from 'readline';
 import { google } from 'googleapis';
 
@@ -24,6 +24,14 @@ function waitForInput(prompt: string): Promise<string> {
 }
 
 async function main(): Promise<void> {
+  if (!CLIENT_ID || !CLIENT_SECRET) {
+    console.error('Error: GMAIL_CLIENT_ID and GMAIL_CLIENT_SECRET must be set in .env');
+    console.error('Add these to your .env file:');
+    console.error('GMAIL_CLIENT_ID=your-client-id');
+    console.error('GMAIL_CLIENT_SECRET=your-client-secret');
+    process.exit(1);
+  }
+
   const auth = new google.auth.OAuth2(CLIENT_ID, CLIENT_SECRET, REDIRECT_URI);
 
   // Generate the authorization URL
