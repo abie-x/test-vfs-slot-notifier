@@ -4,7 +4,8 @@
  */
 
 import { logger } from '../utils/logger';
-import { CDPClient, sleep, selectSubCategory } from './cdp-helpers';
+import { CDPClient, sleep, selectCentre, selectCategory, selectSubCategory } from './cdp-helpers';
+import { CentreConfig } from '../config/centres.config';
 
 /**
  * Click "Start New Booking" button
@@ -57,82 +58,37 @@ export async function clickStartNewBooking(Runtime: any): Promise<boolean> {
 }
 
 /**
- * Setup booking page dropdowns (without selecting sub-category)
+ * Setup booking page - just wait for page to be ready
  */
 export async function setupBookingPage(Runtime: any): Promise<void> {
   logger.info('');
   logger.info('════════════════════════════════════════════════════');
-  logger.info('  Automating booking page setup...');
+  logger.info('  Waiting for booking page to be ready...');
   logger.info('════════════════════════════════════════════════════');
   
   await sleep(2000);
   
-  // Select Application Centre (Mangalore)
-  logger.info('Selecting Application Centre: Mangalore...');
-  const centreResult = await Runtime.evaluate({
-    expression: `
-      (async () => {
-        try {
-          const selects = document.querySelectorAll('mat-select');
-          if (selects.length < 1) return { ok: false, error: 'Centre dropdown not found' };
-          
-          const centreSelect = selects[0];
-          centreSelect.click();
-          await new Promise(r => setTimeout(r, 1000));
-          
-          const options = document.querySelectorAll('mat-option');
-          const mangaloreOption = Array.from(options).find(opt => 
-            opt.textContent?.includes('Mangalore')
-          );
-          
-          if (!mangaloreOption) return { ok: false, error: 'Mangalore option not found' };
-          
-          mangaloreOption.click();
-          await new Promise(r => setTimeout(r, 1000));
-          return { ok: true, selected: mangaloreOption.textContent?.trim() };
-        } catch(e) {
-          return { ok: false, error: String(e) };
-        }
-      })()
-    `,
-    awaitPromise: true,
-    returnByValue: true,
-    timeout: 15_000,
-  });
-  
-  const centreRes = centreResult.result?.value as { ok: boolean; selected?: string; error?: string };
-  if (centreRes?.ok) {
-    logger.info({ centre: centreRes.selected }, '✓ Application Centre selected');
-  } else {
-    logger.warn({ error: centreRes?.error }, 'Failed to select centre — may already be selected');
-  }
-  
-  // Wait for category to auto-populate
-  logger.info('Waiting for Appointment Category to auto-populate...');
-  await sleep(3000);
-  
-  const categoryCheck = await Runtime.evaluate({
+  // Verify dropdowns are present
+  const dropdownCheck = await Runtime.evaluate({
     expression: `
       (() => {
         const selects = document.querySelectorAll('mat-select');
-        if (selects.length < 2) return { found: false };
-        const categoryText = selects[1].textContent?.trim();
-        return { found: true, category: categoryText };
+        return { count: selects.length, ready: selects.length >= 3 };
       })()
     `,
     returnByValue: true,
   });
-  const catRes = categoryCheck.result?.value as { found: boolean; category?: string };
-  logger.info({ category: catRes?.category }, '✓ Appointment Category auto-populated');
   
-  // Wait for sub-category dropdown to be ready
-  logger.info('Waiting for sub-category dropdown to be ready...');
-  await sleep(2000);
+  const result = dropdownCheck.result?.value as { count: number; ready: boolean };
+  if (result?.ready) {
+    logger.info({ dropdownCount: result.count }, '✓ Booking page ready');
+  } else {
+    logger.warn({ dropdownCount: result?.count }, 'Booking page may not be fully loaded');
+  }
   
   logger.info('');
   logger.info('════════════════════════════════════════════════════');
-  logger.info('  ✓ Booking page setup complete!');
-  logger.info('  Network monitoring will capture first API call');
+  logger.info('  ✓ Ready to start multi-centre polling');
   logger.info('════════════════════════════════════════════════════');
 }
 
@@ -141,7 +97,7 @@ export async function setupBookingPage(Runtime: any): Promise<void> {
  */
 export function setupNetworkMonitoring(
   client: CDPClient,
-  onSlotData: (data: { earliestDate: string; slots: number; status: number; pollCount: number }) => void
+  onSlotData: (data: { earliestDate: string; slots: number; status: number; pollCount: number; rawData: any }) => void
 ): void {
   const { Network } = client;
   const pending = new Map<string, number>();
@@ -170,11 +126,139 @@ export function setupNetworkMonitoring(
       const earliestDate = data?.earliestDate ?? 'N/A';
       const slots = data?.earliestSlotLists?.length ?? 0;
       
-      onSlotData({ earliestDate, slots, status, pollCount });
+      onSlotData({ earliestDate, slots, status, pollCount, rawData: data });
     } catch (err: any) {
       logger.warn({ err }, 'Failed to read response body');
     }
   });
+}
+
+/**
+ * Poll a single centre for slot availability
+ */
+export async function pollSingleCentre(
+  Runtime: any,
+  centre: CentreConfig,
+  centreIndex: number,
+  totalCentres: number
+): Promise<void> {
+  // Extract short name for logging
+  let centreName = centre.name;
+  if (centreName.includes('France Visa Application Centre,')) {
+    centreName = centreName.replace('France Visa Application Centre,', '').trim();
+  } else if (centreName.includes('France Visa Application Centre')) {
+    centreName = centreName.replace('France Visa Application Centre', '').trim();
+  } else if (centreName.includes('France Temporary Enrolment Centre-')) {
+    centreName = centreName.replace('France Temporary Enrolment Centre-', '').trim();
+  }
+  
+  logger.info('');
+  logger.info(`[${centreIndex}/${totalCentres}] Checking ${centreName}...`);
+  
+  // Step 1: Select centre
+  const centreSelected = await selectCentre(Runtime, centre.name);
+  if (!centreSelected) {
+    logger.error(`Failed to select centre: ${centreName}`);
+    return;
+  }
+  logger.info(`✓ Centre selected: ${centreName}`);
+  
+  // IMPORTANT: Wait 3 seconds for category dropdown to populate
+  logger.info('Waiting for category dropdown to load...');
+  await sleep(3000);
+  
+  // Step 2: Select category (if needed)
+  if (centre.category !== null) {
+    const categorySelected = await selectCategory(Runtime, centre.category);
+    if (!categorySelected) {
+      logger.error(`Failed to select category: ${centre.category}`);
+      return;
+    }
+    logger.info(`✓ Category selected: ${centre.category}`);
+  } else {
+    logger.info('✓ Category auto-selected');
+  }
+  
+  // IMPORTANT: Wait 3 seconds for subcategory dropdown to populate
+  logger.info('Waiting for subcategory dropdown to load...');
+  await sleep(3000);
+  
+  // Step 3: Select subcategory (triggers API call)
+  const subcategorySelected = await selectSubCategory(Runtime, centre.subcategory);
+  if (!subcategorySelected) {
+    logger.error(`Failed to select subcategory for ${centreName}`);
+    logger.error(`Expected: "${centre.subcategory}"`);
+    logger.error('Check the logs above for available options');
+    return;
+  }
+  const shortSubcat = centre.subcategory.length > 30 
+    ? centre.subcategory.substring(0, 30) + '...' 
+    : centre.subcategory;
+  logger.info(`✓ Subcategory selected: ${shortSubcat}`);
+  
+  // Wait for API response to be captured
+  await sleep(2500);
+}
+
+/**
+ * Start multi-centre polling loop
+ */
+export async function startMultiCentrePolling(
+  Runtime: any,
+  centres: CentreConfig[],
+  minIntervalMs: number,
+  maxIntervalMs: number,
+  onPollComplete: (round: number, centreIndex: number, centreName: string) => void
+): Promise<void> {
+  let pollRound = 0;
+  
+  logger.info('✓ Multi-centre polling active — press Ctrl+C to stop');
+  logger.info(`✓ Monitoring ${centres.length} centres with ${minIntervalMs / 1000}s-${maxIntervalMs / 1000}s randomized interval`);
+  
+  while (true) {
+    pollRound++;
+    logger.info('');
+    logger.info('═══════════════════════════════════════════════════════');
+    logger.info(`  POLL ROUND #${pollRound} - Checking ${centres.length} centres`);
+    logger.info('═══════════════════════════════════════════════════════');
+    
+    for (let i = 0; i < centres.length; i++) {
+      const centre = centres[i];
+      
+      // Extract short name for tracking
+      let centreName = centre.name;
+      if (centreName.includes('France Visa Application Centre,')) {
+        centreName = centreName.replace('France Visa Application Centre,', '').trim();
+      } else if (centreName.includes('France Visa Application Centre')) {
+        centreName = centreName.replace('France Visa Application Centre', '').trim();
+      } else if (centreName.includes('France Temporary Enrolment Centre-')) {
+        centreName = centreName.replace('France Temporary Enrolment Centre-', '').trim();
+      }
+      
+      // Set centre name BEFORE polling so the network handler reads the correct name
+      onPollComplete(pollRound, i + 1, centreName);
+      
+      await pollSingleCentre(Runtime, centre, i + 1, centres.length);
+      
+      // Wait between centres with jitter (except after last centre)
+      if (i < centres.length - 1) {
+        const waitTime = Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1)) + minIntervalMs;
+        logger.info(`Waiting ${(waitTime / 1000).toFixed(1)}s before next centre...`);
+        await sleep(waitTime);
+      }
+    }
+    
+    const now = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
+    logger.info('');
+    logger.info('═══════════════════════════════════════════════════════');
+    logger.info(`  [${now}] ✓ Round #${pollRound} complete - checked ${centres.length} centres`);
+    logger.info('═══════════════════════════════════════════════════════');
+    
+    // Wait before starting next round with jitter
+    const roundWaitTime = Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1)) + minIntervalMs;
+    logger.info(`Waiting ${(roundWaitTime / 1000).toFixed(1)}s before next round...`);
+    await sleep(roundWaitTime);
+  }
 }
 
 /**

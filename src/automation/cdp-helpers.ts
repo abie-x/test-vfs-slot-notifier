@@ -27,6 +27,16 @@ export function sleep(ms: number): Promise<void> {
 }
 
 /**
+ * Sleep with random jitter
+ * @param minMs Minimum milliseconds to sleep
+ * @param maxMs Maximum milliseconds to sleep
+ */
+export function sleepWithJitter(minMs: number, maxMs: number): Promise<void> {
+  const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
+  return sleep(jitter);
+}
+
+/**
  * Connect to Chrome via CDP with retry logic
  */
 export async function connectCDP(filterUrl?: string): Promise<CDPClient> {
@@ -220,19 +230,53 @@ export async function fillOTPField(Runtime: any, otp: string): Promise<void> {
 }
 
 /**
- * Select sub-category from dropdown
+ * Select centre from dropdown
  */
-export async function selectSubCategory(Runtime: any, optionText: string): Promise<boolean> {
+export async function selectCentre(Runtime: any, centreName: string): Promise<boolean> {
   const script = `
     (async () => {
       try {
         const selects = document.querySelectorAll('mat-select');
-        if (selects.length < 3) return { ok: false, error: 'mat-select count: ' + selects.length };
-        selects[2].click();
+        if (selects.length < 1) return { ok: false, error: 'Centre dropdown not found' };
+        selects[0].click();
+        await new Promise(r => setTimeout(r, 1000));
+        const options = document.querySelectorAll('mat-option');
+        const target = Array.from(options).find(o => o.textContent?.trim() === ${JSON.stringify(centreName)});
+        if (!target) return { ok: false, error: 'Centre not found' };
+        target.click();
+        await new Promise(r => setTimeout(r, 1000));
+        return { ok: true };
+      } catch(e) { return { ok: false, error: String(e) }; }
+    })()
+  `;
+  const result = await Runtime.evaluate({
+    expression: script,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: 15_000,
+  });
+  const val = result.result?.value as { ok: boolean; error?: string };
+  if (!val?.ok) {
+    logger.warn({ error: val?.error }, 'selectCentre failed');
+    return false;
+  }
+  return true;
+}
+
+/**
+ * Select category from dropdown
+ */
+export async function selectCategory(Runtime: any, categoryText: string): Promise<boolean> {
+  const script = `
+    (async () => {
+      try {
+        const selects = document.querySelectorAll('mat-select');
+        if (selects.length < 2) return { ok: false, error: 'Category dropdown not found' };
+        selects[1].click();
         await new Promise(r => setTimeout(r, 800));
         const options = document.querySelectorAll('mat-option');
-        const target = Array.from(options).find(o => o.textContent?.trim() === ${JSON.stringify(optionText)});
-        if (!target) return { ok: false, error: 'Option not found' };
+        const target = Array.from(options).find(o => o.textContent?.trim() === ${JSON.stringify(categoryText)});
+        if (!target) return { ok: false, error: 'Category not found' };
         target.click();
         await new Promise(r => setTimeout(r, 500));
         return { ok: true };
@@ -247,10 +291,58 @@ export async function selectSubCategory(Runtime: any, optionText: string): Promi
   });
   const val = result.result?.value as { ok: boolean; error?: string };
   if (!val?.ok) {
-    logger.warn({ error: val?.error }, 'selectSubCategory failed');
+    logger.warn({ error: val?.error }, 'selectCategory failed');
     return false;
   }
-  logger.info({ selected: optionText }, '✓ Sub-category selected');
+  return true;
+}
+
+/**
+ * Select sub-category from dropdown with detailed logging
+ */
+export async function selectSubCategory(Runtime: any, optionText: string): Promise<boolean> {
+  const script = `
+    (async () => {
+      try {
+        const selects = document.querySelectorAll('mat-select');
+        if (selects.length < 3) return { ok: false, error: 'mat-select count: ' + selects.length };
+        selects[2].click();
+        await new Promise(r => setTimeout(r, 800));
+        const options = document.querySelectorAll('mat-option');
+        
+        // Get all available options for debugging
+        const availableOptions = Array.from(options).map(o => o.textContent?.trim());
+        
+        const target = Array.from(options).find(o => o.textContent?.trim() === ${JSON.stringify(optionText)});
+        if (!target) {
+          return { 
+            ok: false, 
+            error: 'Option not found',
+            searchedFor: ${JSON.stringify(optionText)},
+            availableOptions: availableOptions
+          };
+        }
+        target.click();
+        await new Promise(r => setTimeout(r, 500));
+        return { ok: true };
+      } catch(e) { return { ok: false, error: String(e) }; }
+    })()
+  `;
+  const result = await Runtime.evaluate({
+    expression: script,
+    awaitPromise: true,
+    returnByValue: true,
+    timeout: 10_000,
+  });
+  const val = result.result?.value as { ok: boolean; error?: string; searchedFor?: string; availableOptions?: string[] };
+  if (!val?.ok) {
+    logger.warn({ 
+      error: val?.error,
+      searchedFor: val?.searchedFor,
+      availableOptions: val?.availableOptions 
+    }, 'selectSubCategory failed');
+    return false;
+  }
   return true;
 }
 

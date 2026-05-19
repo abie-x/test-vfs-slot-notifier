@@ -28,25 +28,23 @@ import {
   clickStartNewBooking,
   setupBookingPage,
   setupNetworkMonitoring,
-  startPollingLoop,
+  startMultiCentrePolling,
 } from './automation/booking-flow';
+import { CENTRES } from './config/centres.config';
+import { detectSlotChange } from './monitoring/slot-detector';
 
 const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
-const POLL_INTERVAL_MS = parseInt(process.env.POLL_INTERVAL_MS ?? '30000', 10);
 
-const SUB_CATEGORIES = [
-  'Long Stay',
-  'Short Stay - Business',
-  'Short Stay- Tourism/Visiting Family and Friends/Any other short stay',
-];
-
-function ts(): string {
-  return new Date().toLocaleTimeString('en-IN', { timeZone: 'Asia/Kolkata' });
-}
+// Polling interval with jitter (randomized between min and max)
+// IMPORTANT: Set conservatively to avoid rate limiting (HTTP 429)
+const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MIN_MS ?? '45000', 10); // 45 seconds
+const POLL_INTERVAL_MAX_MS = parseInt(process.env.POLL_INTERVAL_MAX_MS ?? '75000', 10); // 75 seconds
 
 async function main(): Promise<void> {
-  logger.info('Campus Slot Notifier — Production (Fully Automated)');
+  logger.info('Campus Slot Notifier — Multi-Centre Monitoring');
+  logger.info('═══════════════════════════════════════════════════════');
+  logger.info(`Monitoring ${CENTRES.length} VFS France centres across India`);
   logger.info('═══════════════════════════════════════════════════════');
 
   // Validate environment variables
@@ -101,39 +99,39 @@ async function main(): Promise<void> {
     logger.warn('Please click "Start New Booking" manually');
   }
 
-  // Step 7: Setup booking page (centre + category only, no sub-category yet)
+  // Step 7: Setup booking page (just verify it's ready)
   await setupBookingPage(client.Runtime);
 
-  // Step 8: Enable network monitoring BEFORE selecting first sub-category
+  // Step 8: Enable network monitoring BEFORE any centre selection
   await client.Network.enable();
-  
-  let lastEarliestDate: string | null = null;
-  
-  setupNetworkMonitoring(client, ({ earliestDate, slots, status, pollCount }) => {
+
+  let currentCentreName = '';
+
+  setupNetworkMonitoring(client, ({ earliestDate, slots, status, pollCount, rawData }) => {
     const now = new Date().toLocaleTimeString('en-IN', {
       hour: '2-digit',
       minute: '2-digit',
       second: '2-digit',
       hour12: true,
     });
+
     logger.info(
-      `[${now}] Poll #${pollCount} — earliestDate: ${earliestDate} | status: ${status} | slots: ${slots}`
+      `[${now}] [${currentCentreName}] Poll #${pollCount} — ` +
+      `earliestDate: ${earliestDate} | status: ${status} | slots: ${slots}`
     );
 
-    if (earliestDate !== lastEarliestDate && lastEarliestDate !== null && earliestDate !== 'N/A') {
-      logger.warn({ old: lastEarliestDate, new: earliestDate }, '⚠️  SLOT CHANGE DETECTED');
+    if (status === 200) {
+      // Persist state to Redis and detect changes — fire-and-forget, errors are
+      // caught inside detectSlotChange so they never crash the polling loop
+      const capturedName = currentCentreName;
+      detectSlotChange(capturedName, rawData).catch((err) => {
+        logger.warn({ err: err.message, centre: capturedName }, 'detectSlotChange threw unexpectedly');
+      });
     }
-    lastEarliestDate = earliestDate;
   });
 
-  // Step 9: Now select first sub-category to trigger first API call (will be captured)
-  logger.info('Selecting first sub-category to trigger initial slot check...');
-  const { selectSubCategory } = await import('./automation/cdp-helpers');
-  await selectSubCategory(client.Runtime, SUB_CATEGORIES[0]);
-  await sleep(3000); // Wait for first API response
-
-  // Step 10: Start polling loop
-  logger.info('Starting automated polling...');
+  // Step 9: Start multi-centre polling loop
+  logger.info('Starting multi-centre polling...');
   
   // Handle graceful shutdown
   process.on('SIGINT', async () => {
@@ -143,9 +141,15 @@ async function main(): Promise<void> {
     process.exit(0);
   });
 
-  await startPollingLoop(client.Runtime, SUB_CATEGORIES, POLL_INTERVAL_MS, (category) => {
-    logger.info(`[${ts()}] Triggering poll — "${category}"`);
-  });
+  await startMultiCentrePolling(
+    client.Runtime,
+    CENTRES,
+    POLL_INTERVAL_MIN_MS,
+    POLL_INTERVAL_MAX_MS,
+    (_round, _centreIndex, centreName) => {
+      currentCentreName = centreName;
+    }
+  );
 }
 
 main().catch((err) => {

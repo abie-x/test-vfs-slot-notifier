@@ -44,11 +44,11 @@ export const CENTRES: CentreConfig[] = [
   {
     name: 'France Temporary Enrolment Centre-Mangalore',
     category: null,
-    subcategory: 'Short Stay - Tourism/Visiting Family and Friends/Any other short stay',
+    subcategory: 'Short Stay- Tourism/Visiting Family and Friends/Any other short stay',
   },
   {
     name:'France Temporary Enrolment Centre-Vishakhapatnam',
-    category: null, // Auto-selected (only one category)
+    category: null, 
     subcategory: 'Short stay-Tourism/Visiting family and friends/Any other short stay',
   },
   {
