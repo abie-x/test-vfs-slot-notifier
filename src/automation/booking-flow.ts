@@ -1,6 +1,10 @@
 /**
  * Booking Flow Automation
- * Handles booking page navigation and slot polling
+ * Handles booking page navigation and slot polling.
+ *
+ * Experiment 1: startMultiCentrePolling (infinite loop) has been removed.
+ * The orchestrator in session-orchestrator.ts drives a single-pass poll
+ * per session via pollSingleCentre() called directly from index.ts.
  */
 
 import { logger } from '../utils/logger';
@@ -202,6 +206,8 @@ export async function pollSingleCentre(
 
 /**
  * Start multi-centre polling loop
+ * @deprecated Not used in Experiment 1. The orchestrator drives single-pass
+ * polling via pollSingleCentre() called directly from index.ts.
  */
 export async function startMultiCentrePolling(
   Runtime: any,
@@ -263,6 +269,7 @@ export async function startMultiCentrePolling(
 
 /**
  * Start polling loop
+ * @deprecated Not used in Experiment 1.
  */
 export async function startPollingLoop(
   Runtime: any,

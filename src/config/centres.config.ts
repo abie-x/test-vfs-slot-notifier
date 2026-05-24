@@ -53,7 +53,7 @@ export const CENTRES: CentreConfig[] = [
   },
   {
     name: 'France Visa Application Center, Guwahati',
-    category: 'Short Stay',
+    category: null,
     subcategory: 'Tourist',
   },
   {

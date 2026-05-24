@@ -1,158 +1,334 @@
 /**
- * Campus Slot Notifier — Production (Fully Automated)
+ * Campus Slot Notifier — Experiment 1 (Session Segmentation Without Proxies)
  *
- * Optimized architecture with modular design:
- *   - Reusable CDP helper functions
- *   - Separated login and booking flows
- *   - Improved error handling and retry logic
- *   - Cleaner code organization
+ * Architecture:
+ *   - ONE active session at a time
+ *   - ONE Chrome instance at a time
+ *   - SESSION_A polls centres 1–9, SESSION_B polls centres 10–18
+ *   - 10-minute cooldown between sessions (no browser active)
+ *   - 3–4 minute randomized delay between centre changes
+ *   - Fully autonomous: loops forever after a single `npm start`
  *
  * Turnstile Strategy: Disconnect/Reconnect Cycle
- * - Initial disconnect: 7s (login) / 8s (OTP) for Turnstile to render
- * - Check button status every 60 seconds (5 checks total)
- * - Disconnect between checks (gives Turnstile 60s windows to work)
- * - Reconnect briefly (1-2s) only to check button status
- * - Total patience: ~247 seconds before reload retry
- * - One reload retry, then exits if still fails
+ *   - Disconnect CDP before Turnstile renders (7s login / 8s OTP)
+ *   - Check button status every 60 seconds (5 checks total)
+ *   - Reconnect briefly only to check button status
  *
  * Usage: npm start
  */
 
 import 'dotenv/config';
 import { logger } from './utils/logger';
-import { POLL_USER_DATA_DIR, REMOTE_DEBUG_PORT } from './auth/browser';
-import { spawn } from 'child_process';
+import { launchChrome, shutdownChrome } from './auth/browser';
 import { connectCDP, sleep } from './automation/cdp-helpers';
 import { performLogin, handleOTPScreen, waitForLoginComplete } from './automation/login-flow';
 import {
   clickStartNewBooking,
   setupBookingPage,
   setupNetworkMonitoring,
-  startMultiCentrePolling,
+  pollSingleCentre,
 } from './automation/booking-flow';
 import { CENTRES } from './config/centres.config';
 import { detectSlotChange } from './monitoring/slot-detector';
+import {
+  startOrchestrationLoop,
+  SessionPhase,
+} from './orchestration/session-orchestrator';
 
-const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
-const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
+// 3–4 minute randomized delay between centre changes (Experiment 1 requirement)
+const CENTRE_DELAY_MIN_MS = parseInt(process.env.CENTRE_DELAY_MIN_MS ?? '180000', 10); // 3 min
+const CENTRE_DELAY_MAX_MS = parseInt(process.env.CENTRE_DELAY_MAX_MS ?? '240000', 10); // 4 min
 
-// Polling interval with jitter (randomized between min and max)
-// IMPORTANT: Set conservatively to avoid rate limiting (HTTP 429)
-const POLL_INTERVAL_MIN_MS = parseInt(process.env.POLL_INTERVAL_MIN_MS ?? '45000', 10); // 45 seconds
-const POLL_INTERVAL_MAX_MS = parseInt(process.env.POLL_INTERVAL_MAX_MS ?? '75000', 10); // 75 seconds
+// ---------------------------------------------------------------------------
+// Timestamp helper
+// Returns a compact [HH:MM:SS] string in IST for log prefixes.
+// ---------------------------------------------------------------------------
+function ts(): string {
+  return new Date().toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Kolkata',
+  });
+}
 
-async function main(): Promise<void> {
-  logger.info('Campus Slot Notifier — Multi-Centre Monitoring');
+// ---------------------------------------------------------------------------
+// Single session runner
+// Called by the orchestrator once per session cycle.
+// Responsible for: Chrome launch → login → poll → Chrome shutdown.
+// ---------------------------------------------------------------------------
+
+async function runSession(phase: SessionPhase, centreSlice: [number, number]): Promise<void> {
+  const [sliceStart, sliceEnd] = centreSlice;
+  const sessionCentres = CENTRES.slice(sliceStart, sliceEnd);
+
+  logger.info('');
   logger.info('═══════════════════════════════════════════════════════');
-  logger.info(`Monitoring ${CENTRES.length} VFS France centres across India`);
+  logger.info(`  [${ts()}] [${phase}] SESSION START`);
+  logger.info(`  [${ts()}] [${phase}] Centres: ${sliceStart + 1}–${sliceEnd} (${sessionCentres.length} centres)`);
+  logger.info(`  [${ts()}] [${phase}] Centre delay: ${CENTRE_DELAY_MIN_MS / 1000}s – ${CENTRE_DELAY_MAX_MS / 1000}s`);
   logger.info('═══════════════════════════════════════════════════════');
 
   // Validate environment variables
   const email = process.env.VFS_EMAIL ?? '';
   const password = process.env.VFS_PASSWORD ?? '';
   if (!email || !password) {
-    logger.error('VFS_EMAIL and VFS_PASSWORD must be set');
+    logger.error(`[${ts()}] VFS_EMAIL and VFS_PASSWORD must be set`);
     process.exit(1);
   }
 
-  // Step 1: Launch Chrome
-  logger.info('Launching Chrome...');
-  const chromeProc = spawn(
-    CHROME_EXECUTABLE,
-    [
-      `--user-data-dir=${POLL_USER_DATA_DIR}`,
-      `--remote-debugging-port=${REMOTE_DEBUG_PORT}`,
-      VFS_LOGIN_URL,
-    ],
-    { detached: false, stdio: 'ignore' }
-  );
-  await sleep(3000);
+  // ------------------------------------------------------------------
+  // Chrome launch
+  // ------------------------------------------------------------------
+  logger.info(`[${ts()}] [${phase}] Launching fresh Chrome instance...`);
+  const chromeProc = await launchChrome();
+  logger.info(`[${ts()}] [${phase}] ✓ Chrome launched (PID: ${chromeProc.pid})`);
 
-  // Step 2: Connect CDP and perform login
-  logger.info('Connecting CDP...');
-  let client = await connectCDP();
-  await client.Page.enable();
-  await client.Runtime.enable();
+  // Track CDP client so we can close it before killing Chrome
+  let cdpClient: Awaited<ReturnType<typeof connectCDP>> | null = null;
 
-  client = await performLogin(client, email, password);
+  try {
+    // ------------------------------------------------------------------
+    // Login
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] LOGIN START — connecting CDP...`);
+    let client = await connectCDP();
+    cdpClient = client;
+    await client.Page.enable();
+    await client.Runtime.enable();
+    logger.info(`[${ts()}] [${phase}] CDP connected — starting login flow`);
 
-  // Step 3: Handle OTP screen
-  client = await handleOTPScreen(client);
+    client = await performLogin(client, email, password);
+    cdpClient = client;
+    logger.info(`[${ts()}] [${phase}] ✓ Login credentials submitted`);
 
-  // Step 4: Wait for login completion
-  await waitForLoginComplete(client.Runtime);
+    // ------------------------------------------------------------------
+    // OTP
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] OTP START — waiting for OTP screen...`);
+    client = await handleOTPScreen(client);
+    cdpClient = client;
+    logger.info(`[${ts()}] [${phase}] ✓ OTP submitted`);
 
-  // Step 5: Dismiss password save dialog
-  logger.info('Dismissing password save dialog...');
-  await sleep(2000);
-  await client.Runtime.evaluate({
-    expression: `
-      document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
-    `,
-    returnByValue: true,
-  });
-  await sleep(1000);
+    // ------------------------------------------------------------------
+    // Login completion
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] Waiting for post-login redirect...`);
+    await waitForLoginComplete(client.Runtime);
+    logger.info(`[${ts()}] [${phase}] ✓ LOGIN COMPLETE`);
 
-  // Step 6: Click "Start New Booking"
-  const bookingClicked = await clickStartNewBooking(client.Runtime);
-  if (!bookingClicked) {
-    logger.warn('Please click "Start New Booking" manually');
-  }
+    // ------------------------------------------------------------------
+    // Dismiss password save dialog
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] Dismissing password save dialog...`);
+    await sleep(2000);
+    await client.Runtime.evaluate({
+      expression: `
+        document.dispatchEvent(new KeyboardEvent('keydown', { key: 'Escape', keyCode: 27, bubbles: true }));
+      `,
+      returnByValue: true,
+    });
+    await sleep(1000);
 
-  // Step 7: Setup booking page (just verify it's ready)
-  await setupBookingPage(client.Runtime);
+    // ------------------------------------------------------------------
+    // Start New Booking
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] Clicking "Start New Booking"...`);
+    const bookingClicked = await clickStartNewBooking(client.Runtime);
+    if (!bookingClicked) {
+      logger.warn(`[${ts()}] [${phase}] "Start New Booking" not found — manual click may be needed`);
+    } else {
+      logger.info(`[${ts()}] [${phase}] ✓ "Start New Booking" clicked`);
+    }
 
-  // Step 8: Enable network monitoring BEFORE any centre selection
-  await client.Network.enable();
+    // ------------------------------------------------------------------
+    // Booking page ready
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] Waiting for booking page...`);
+    await setupBookingPage(client.Runtime);
+    logger.info(`[${ts()}] [${phase}] ✓ Booking page ready`);
 
-  let currentCentreName = '';
+    // ------------------------------------------------------------------
+    // Network monitoring
+    // ------------------------------------------------------------------
+    await client.Network.enable();
+    logger.info(`[${ts()}] [${phase}] ✓ Network monitoring active`);
 
-  setupNetworkMonitoring(client, ({ earliestDate, slots, status, pollCount, rawData }) => {
-    const now = new Date().toLocaleTimeString('en-IN', {
-      hour: '2-digit',
-      minute: '2-digit',
-      second: '2-digit',
-      hour12: true,
+    let currentCentreName = '';
+
+    // Abort flag — set to true by the network monitor when a fatal API
+    // response is detected (429 rate limit or session invalidation).
+    // The polling loop checks this flag after each centre and exits early.
+    let sessionAborted = false;
+    let abortReason = '';
+
+    setupNetworkMonitoring(client, ({ earliestDate, slots, status, pollCount, rawData }) => {
+      logger.info(
+        `[${ts()}] [${phase}] [${currentCentreName}] Poll #${pollCount} — ` +
+        `status: ${status} | earliestDate: ${earliestDate} | slots: ${slots}`
+      );
+
+      if (status === 429) {
+        logger.warn(`[${ts()}] [${phase}] [${currentCentreName}] ⚠️  HTTP 429 — rate limited (Permission Issue 429201)`);
+        sessionAborted = true;
+        abortReason = 'HTTP 429 rate limit';
+      }
+
+      // Session invalidation: VFS returns 401 or redirects to login mid-session
+      if (status === 401) {
+        logger.warn(`[${ts()}] [${phase}] [${currentCentreName}] ⚠️  HTTP 401 — session expired or invalid`);
+        sessionAborted = true;
+        abortReason = 'HTTP 401 session expired';
+      }
+
+      if (status === 200) {
+        const capturedName = currentCentreName;
+        detectSlotChange(capturedName, rawData).catch((err) => {
+          logger.warn({ err: err.message, centre: capturedName }, 'detectSlotChange threw unexpectedly');
+        });
+      }
     });
 
-    logger.info(
-      `[${now}] [${currentCentreName}] Poll #${pollCount} — ` +
-      `earliestDate: ${earliestDate} | status: ${status} | slots: ${slots}`
-    );
+    // ------------------------------------------------------------------
+    // Centre polling — single pass through this session's batch
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] POLLING START — ${sessionCentres.length} centres`);
 
-    if (status === 200) {
-      // Persist state to Redis and detect changes — fire-and-forget, errors are
-      // caught inside detectSlotChange so they never crash the polling loop
-      const capturedName = currentCentreName;
-      detectSlotChange(capturedName, rawData).catch((err) => {
-        logger.warn({ err: err.message, centre: capturedName }, 'detectSlotChange threw unexpectedly');
-      });
+    for (let i = 0; i < sessionCentres.length; i++) {
+      // Check abort flag before each centre
+      if (sessionAborted) {
+        logger.warn(`[${ts()}] [${phase}] SESSION ABORTED — reason: ${abortReason}`);
+        logger.warn(`[${ts()}] [${phase}] Stopping poll at centre ${i + 1}/${sessionCentres.length} — handing off to orchestrator`);
+        throw new Error(`Session aborted: ${abortReason}`);
+      }
+
+      const centre = sessionCentres[i];
+
+      // Extract short name for log readability
+      let centreName = centre.name;
+      if (centreName.includes('France Visa Application Centre,')) {
+        centreName = centreName.replace('France Visa Application Centre,', '').trim();
+      } else if (centreName.includes('France Visa Application Centre')) {
+        centreName = centreName.replace('France Visa Application Centre', '').trim();
+      } else if (centreName.includes('France Temporary Enrolment Centre-')) {
+        centreName = centreName.replace('France Temporary Enrolment Centre-', '').trim();
+      }
+
+      currentCentreName = centreName;
+
+      logger.info('');
+      logger.info(`[${ts()}] [${phase}] ── Centre ${i + 1}/${sessionCentres.length}: ${centreName}`);
+
+      await pollSingleCentre(client.Runtime, centre, i + 1, sessionCentres.length);
+
+      logger.info(`[${ts()}] [${phase}] ✓ ${centreName} polled`);
+
+      // Check abort flag immediately after poll — a 429 may have arrived
+      // during the pollSingleCentre call itself
+      if (sessionAborted) {
+        logger.warn(`[${ts()}] [${phase}] SESSION ABORTED after polling ${centreName} — reason: ${abortReason}`);
+        throw new Error(`Session aborted: ${abortReason}`);
+      }
+
+      // Also detect session invalidation via URL (VFS redirects to /login on expiry)
+      try {
+        const urlCheck = await client.Runtime.evaluate({
+          expression: 'location.pathname',
+          returnByValue: true,
+        });
+        const path = String(urlCheck.result?.value ?? '');
+        if (path.includes('/login')) {
+          logger.warn(`[${ts()}] [${phase}] ⚠️  Session Expired or Invalid — redirected to login page`);
+          throw new Error('Session expired: redirected to login');
+        }
+      } catch (err: any) {
+        // If the error is our own throw, re-throw it
+        if (err.message?.includes('Session expired')) throw err;
+        // Otherwise CDP may be briefly disconnected — non-fatal, continue
+      }
+
+      // 3–4 minute randomized delay between centres (except after last)
+      if (i < sessionCentres.length - 1) {
+        const waitMs =
+          Math.floor(Math.random() * (CENTRE_DELAY_MAX_MS - CENTRE_DELAY_MIN_MS + 1)) +
+          CENTRE_DELAY_MIN_MS;
+        const waitMin = (waitMs / 60000).toFixed(1);
+        const resumeAt = new Date(Date.now() + waitMs).toLocaleTimeString('en-IN', {
+          hour: '2-digit',
+          minute: '2-digit',
+          second: '2-digit',
+          hour12: false,
+          timeZone: 'Asia/Kolkata',
+        });
+        logger.info(`[${ts()}] [${phase}] Centre delay: ${waitMin} min — next centre at ${resumeAt}`);
+        await sleep(waitMs);
+      }
     }
-  });
 
-  // Step 9: Start multi-centre polling loop
-  logger.info('Starting multi-centre polling...');
-  
-  // Handle graceful shutdown
-  process.on('SIGINT', async () => {
-    logger.info('\nStopping...');
+    logger.info('');
+    logger.info(`[${ts()}] [${phase}] ✓ POLLING COMPLETE — all ${sessionCentres.length} centres done`);
+
+    // ------------------------------------------------------------------
+    // Close CDP cleanly before killing Chrome
+    // ------------------------------------------------------------------
+    logger.info(`[${ts()}] [${phase}] Closing CDP connection...`);
     await client.close().catch(() => {});
-    chromeProc.kill();
+    cdpClient = null;
+    logger.info(`[${ts()}] [${phase}] ✓ CDP closed`);
+
+  } finally {
+    // ------------------------------------------------------------------
+    // Guaranteed Chrome shutdown — runs even on error
+    // Order: close CDP → SIGTERM → wait → SIGKILL → port cleanup
+    // ------------------------------------------------------------------
+    if (cdpClient !== null) {
+      logger.info(`[${ts()}] [${phase}] Closing CDP connection (error path)...`);
+      await (cdpClient as any).close().catch(() => {});
+      cdpClient = null;
+    }
+
+    logger.info(`[${ts()}] [${phase}] BROWSER SHUTDOWN — terminating Chrome...`);
+    await shutdownChrome(chromeProc);
+
+    logger.info('');
+    logger.info('═══════════════════════════════════════════════════════');
+    logger.info(`  [${ts()}] [${phase}] SESSION END`);
+    logger.info(`  [${ts()}] [${phase}] ✓ Chrome terminated`);
+    logger.info(`  [${ts()}] [${phase}] ✓ CDP disconnected`);
+    logger.info(`  [${ts()}] [${phase}] ✓ Port 9223 released`);
+    logger.info('═══════════════════════════════════════════════════════');
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Entry point
+// ---------------------------------------------------------------------------
+
+async function main(): Promise<void> {
+  logger.info('');
+  logger.info('╔═══════════════════════════════════════════════════════╗');
+  logger.info('║  Campus Slot Notifier — Experiment 1                  ║');
+  logger.info('║  Session Segmentation Without Proxies                 ║');
+  logger.info('╚═══════════════════════════════════════════════════════╝');
+  logger.info(`[${ts()}] Application start`);
+  logger.info(`[${ts()}] Monitoring ${CENTRES.length} VFS France centres across India`);
+  logger.info(`[${ts()}] Strategy: slow segmented sessions | full browser recycling | no proxies`);
+  logger.info(`[${ts()}] Centre delay: ${CENTRE_DELAY_MIN_MS / 1000}s – ${CENTRE_DELAY_MAX_MS / 1000}s`);
+  logger.info(`[${ts()}] Cooldown: ${parseInt(process.env.SESSION_COOLDOWN_MS ?? '600000', 10) / 60000} min between sessions`);
+  logger.info('');
+
+  // Handle graceful shutdown
+  process.on('SIGINT', () => {
+    logger.info(`\n[${ts()}] [Main] SIGINT received — shutting down`);
     process.exit(0);
   });
 
-  await startMultiCentrePolling(
-    client.Runtime,
-    CENTRES,
-    POLL_INTERVAL_MIN_MS,
-    POLL_INTERVAL_MAX_MS,
-    (_round, _centreIndex, centreName) => {
-      currentCentreName = centreName;
-    }
-  );
+  // Start the autonomous orchestration loop — runs forever
+  await startOrchestrationLoop({ runSession });
 }
 
 main().catch((err) => {
-  logger.error({ err }, 'Fatal error');
+  logger.error({ err }, `[${ts()}] Fatal error`);
   process.exit(1);
 });
