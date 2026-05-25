@@ -38,10 +38,17 @@ redis.connect().catch(() => {
 // Types
 // ---------------------------------------------------------------------------
 
+export interface SlotEntry {
+  date: string;
+  applicants: number[]; // parsed from the comma-separated `applicant` field
+}
+
 export interface CentreSlotState {
   earliestDate: string | null;
   hasSlots: boolean;
-  lastChecked: string; // ISO timestamp
+  slotEntries: SlotEntry[]; // one entry per earliestSlotLists element
+  totalApplicants: number;  // sum of applicants across all entries
+  lastChecked: string;      // ISO timestamp
 }
 
 export type SlotChangeType = 'appeared' | 'earlier' | 'disappeared' | 'none';
@@ -65,9 +72,21 @@ export async function detectSlotChange(
   const redisKey = `slots:FRA:${centreName}`;
 
   // Build current state from API response
+  const rawEntries: any[] = apiResponse?.earliestSlotLists ?? [];
+  const slotEntries: SlotEntry[] = rawEntries.map((entry: any) => ({
+    date: entry?.date ?? '',
+    applicants: String(entry?.applicant ?? '')
+      .split(',')
+      .map((s: string) => parseInt(s.trim(), 10))
+      .filter((n: number) => !isNaN(n)),
+  }));
+  const totalApplicants = slotEntries.reduce((sum, e) => sum + e.applicants.length, 0);
+
   const currentState: CentreSlotState = {
     earliestDate: apiResponse?.earliestDate ?? null,
-    hasSlots: (apiResponse?.earliestSlotLists?.length ?? 0) > 0,
+    hasSlots: slotEntries.length > 0 && totalApplicants > 0,
+    slotEntries,
+    totalApplicants,
     lastChecked: new Date().toISOString(),
   };
 
@@ -98,7 +117,7 @@ export async function detectSlotChange(
   // ---------------------------------------------------------------------------
   if (!previousState) {
     logger.info(
-      `[${centreName}] First observation — earliestDate: ${currentState.earliestDate} | hasSlots: ${currentState.hasSlots}`
+      `[${centreName}] First observation — earliestDate: ${currentState.earliestDate} | hasSlots: ${currentState.hasSlots} | applicants: ${currentState.totalApplicants}`
     );
     return 'none';
   }
@@ -108,7 +127,7 @@ export async function detectSlotChange(
   // ---------------------------------------------------------------------------
   if (!previousState.hasSlots && currentState.hasSlots) {
     logger.warn(
-      `🚨 SLOTS APPEARED — ${centreName} | earliestDate: ${currentState.earliestDate}`
+      `🚨 SLOTS APPEARED — ${centreName} | earliestDate: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
     );
     return 'appeared';
   }
@@ -125,7 +144,7 @@ export async function detectSlotChange(
     currentState.earliestDate < previousState.earliestDate
   ) {
     logger.warn(
-      `🚨 EARLIER DATE — ${centreName} | was: ${previousState.earliestDate} → now: ${currentState.earliestDate}`
+      `🚨 EARLIER DATE — ${centreName} | was: ${previousState.earliestDate} → now: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
     );
     return 'earlier';
   }
@@ -142,7 +161,7 @@ export async function detectSlotChange(
   // No meaningful change
   // ---------------------------------------------------------------------------
   logger.info(
-    `✓ No change — ${centreName} | earliestDate: ${currentState.earliestDate} | hasSlots: ${currentState.hasSlots}`
+    `✓ No change — ${centreName} | earliestDate: ${currentState.earliestDate} | hasSlots: ${currentState.hasSlots} | applicants: ${currentState.totalApplicants}`
   );
   return 'none';
 }

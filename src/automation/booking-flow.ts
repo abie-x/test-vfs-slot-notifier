@@ -128,8 +128,21 @@ export function setupNetworkMonitoring(
       pollCount++;
       
       const earliestDate = data?.earliestDate ?? 'N/A';
-      const slots = data?.earliestSlotLists?.length ?? 0;
-      
+
+      // Each entry in earliestSlotLists has an `applicant` field that is a
+      // comma-separated string of applicant numbers (e.g. "1,2,3,4,5").
+      // Count total applicants across all slot entries.
+      const slots: number = (data?.earliestSlotLists ?? []).reduce(
+        (sum: number, entry: any) => {
+          const applicants = String(entry?.applicant ?? '')
+            .split(',')
+            .map((s: string) => s.trim())
+            .filter(Boolean);
+          return sum + applicants.length;
+        },
+        0
+      );
+
       onSlotData({ earliestDate, slots, status, pollCount, rawData: data });
     } catch (err: any) {
       logger.warn({ err }, 'Failed to read response body');
