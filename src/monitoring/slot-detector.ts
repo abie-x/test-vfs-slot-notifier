@@ -12,6 +12,7 @@
 
 import Redis from 'ioredis';
 import { logger } from '../utils/logger';
+import { notifyDateChange } from '../services/telegram-notifier';
 
 // ---------------------------------------------------------------------------
 // Redis client — connection errors are caught and logged; they do not crash
@@ -113,11 +114,22 @@ export async function detectSlotChange(
   }
 
   // ---------------------------------------------------------------------------
-  // No previous state — first run for this centre, no alert
+  // No previous state — first run for this centre
+  // If slots are already available, notify immediately (it's new to us).
+  // If no slots, just save baseline silently.
   // ---------------------------------------------------------------------------
   if (!previousState) {
+    if (currentState.hasSlots) {
+      logger.warn(
+        `🚨 FIRST OBSERVATION WITH SLOTS — ${centreName} | earliestDate: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
+      );
+      notifyDateChange(centreName, null, currentState.earliestDate ?? '').catch((err) => {
+        logger.warn({ err: err.message }, '[Telegram] notifyDateChange threw unexpectedly (first observation)');
+      });
+      return 'appeared';
+    }
     logger.info(
-      `[${centreName}] First observation — earliestDate: ${currentState.earliestDate} | hasSlots: ${currentState.hasSlots} | applicants: ${currentState.totalApplicants}`
+      `[${centreName}] First observation — no slots | earliestDate: ${currentState.earliestDate}`
     );
     return 'none';
   }
@@ -129,6 +141,9 @@ export async function detectSlotChange(
     logger.warn(
       `🚨 SLOTS APPEARED — ${centreName} | earliestDate: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
     );
+    notifyDateChange(centreName, previousState.earliestDate, currentState.earliestDate ?? '').catch((err) => {
+      logger.warn({ err: err.message }, '[Telegram] notifyDateChange threw unexpectedly (appeared)');
+    });
     return 'appeared';
   }
 
@@ -146,6 +161,9 @@ export async function detectSlotChange(
     logger.warn(
       `🚨 EARLIER DATE — ${centreName} | was: ${previousState.earliestDate} → now: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
     );
+    notifyDateChange(centreName, previousState.earliestDate, currentState.earliestDate).catch((err) => {
+      logger.warn({ err: err.message }, '[Telegram] notifyDateChange threw unexpectedly (earlier)');
+    });
     return 'earlier';
   }
 
