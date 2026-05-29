@@ -2,17 +2,16 @@
  * Account Manager — Account Rotation to Avoid "Too Many Logins" Error
  *
  * VFS Global blocks accounts after ~9 logins in 4 hours.
- * Strategy: rotate between 2 accounts after each full sweep (18 centres = 3 sessions).
+ * Strategy: rotate between 3 accounts after each full sweep (18 centres = 3 sessions).
  *
  * Redis keys:
- *   account:current_index — 0 or 1 (which account is currently active)
+ *   account:current_index — 0, 1, or 2 (which account is currently active)
  *   account:sweep_count   — number of sessions completed in current sweep
  *
  * Rotation logic:
  *   - 1 full sweep = 3 sessions (SESSION_A → SESSION_B → SESSION_C)
- *   - After SESSION_C completes, increment sweep count
- *   - If sweep count reaches 1, switch account and reset sweep count
- *   - This means: Account 1 does 1 sweep → Account 2 does 1 sweep → repeat
+ *   - After SESSION_C completes, rotate to next account (0 → 1 → 2 → 0)
+ *   - Account 1 does 1 sweep → Account 2 does 1 sweep → Account 3 does 1 sweep → repeat
  */
 
 import Redis from 'ioredis';
@@ -71,20 +70,22 @@ interface AccountCredentials {
  * Get both account credentials from environment variables.
  * Throws if any required variable is missing.
  */
-function getAccountCredentials(): [AccountCredentials, AccountCredentials] {
+function getAccountCredentials(): [AccountCredentials, AccountCredentials, AccountCredentials] {
   const email1 = process.env.VFS_EMAIL_ACCOUNT1;
   const email2 = process.env.VFS_EMAIL_ACCOUNT2;
+  const email3 = process.env.VFS_EMAIL_ACCOUNT3;
   const password = process.env.VFS_PASSWORD;
 
-  if (!email1 || !email2 || !password) {
+  if (!email1 || !email2 || !email3 || !password) {
     throw new Error(
-      'Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, and VFS_PASSWORD must all be set'
+      'Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, VFS_EMAIL_ACCOUNT3, and VFS_PASSWORD must all be set'
     );
   }
 
   return [
     { email: email1, password },
     { email: email2, password },
+    { email: email3, password },
   ];
 }
 
@@ -93,13 +94,16 @@ function getAccountCredentials(): [AccountCredentials, AccountCredentials] {
 // ---------------------------------------------------------------------------
 
 /**
- * Get current account index (0 or 1).
+ * Get current account index (0, 1, or 2).
  * Defaults to 0 if not set.
  */
 async function getCurrentAccountIndex(): Promise<number> {
   try {
     const raw = await redis.get(REDIS_KEY_CURRENT_INDEX);
-    if (raw === '0' || raw === '1') return parseInt(raw, 10);
+    if (raw !== null) {
+      const parsed = parseInt(raw, 10);
+      if (parsed >= 0 && parsed <= 2) return parsed;
+    }
   } catch {
     // Redis unavailable — default to account 0
   }
@@ -107,7 +111,7 @@ async function getCurrentAccountIndex(): Promise<number> {
 }
 
 /**
- * Set current account index (0 or 1).
+ * Set current account index (0, 1, or 2).
  */
 async function setCurrentAccountIndex(index: number): Promise<void> {
   try {
@@ -152,9 +156,9 @@ async function setSweepCount(count: number): Promise<void> {
  * Returns { email, password } for the current account.
  */
 export async function getCurrentAccount(): Promise<AccountCredentials> {
-  const [account1, account2] = getAccountCredentials();
+  const [account1, account2, account3] = getAccountCredentials();
   const index = await getCurrentAccountIndex();
-  const account = index === 0 ? account1 : account2;
+  const account = index === 0 ? account1 : index === 1 ? account2 : account3;
 
   logger.info(`[${ts()}] [AccountManager] Using account ${index + 1}: ${account.email}`);
   return account;
@@ -173,15 +177,16 @@ export async function incrementSessionAndCheckRotation(): Promise<boolean> {
   logger.info(`[${ts()}] [AccountManager] Session completed — sweep progress: ${newSweepCount}/${SESSIONS_PER_SWEEP}`);
 
   if (newSweepCount >= SESSIONS_PER_SWEEP) {
-    // Full sweep completed — rotate account
+    // Full sweep completed — rotate to next account (0 → 1 → 2 → 0)
     const currentIndex = await getCurrentAccountIndex();
-    const newIndex = currentIndex === 0 ? 1 : 0;
+    const newIndex = (currentIndex + 1) % 3;
 
     await setCurrentAccountIndex(newIndex);
     await setSweepCount(0);
 
-    const [account1, account2] = getAccountCredentials();
-    const newAccount = newIndex === 0 ? account1 : account2;
+    const [account1, account2, account3] = getAccountCredentials();
+    const accounts = [account1, account2, account3];
+    const newAccount = accounts[newIndex];
 
     logger.info('');
     logger.info('═══════════════════════════════════════════════════════');
@@ -207,10 +212,11 @@ export async function getRotationStatus(): Promise<{
   currentEmail: string;
   sweepProgress: string;
 }> {
-  const [account1, account2] = getAccountCredentials();
+  const [account1, account2, account3] = getAccountCredentials();
+  const accounts = [account1, account2, account3];
   const index = await getCurrentAccountIndex();
   const sweepCount = await getSweepCount();
-  const currentEmail = index === 0 ? account1.email : account2.email;
+  const currentEmail = accounts[index].email;
 
   return {
     currentAccountIndex: index,
