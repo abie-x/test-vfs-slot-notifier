@@ -27,6 +27,7 @@ import { execSync } from 'child_process';
 import { logger } from '../utils/logger';
 import { sleep } from '../automation/cdp-helpers';
 import { REMOTE_DEBUG_PORT } from '../auth/browser';
+import { incrementSessionAndCheckRotation, getRotationStatus } from '../auth/account-manager';
 
 // ---------------------------------------------------------------------------
 // Timestamp helper — IST [HH:MM:SS]
@@ -425,7 +426,9 @@ export async function startOrchestrationLoop(callbacks: OrchestratorCallbacks): 
   // Read persisted phase (crash recovery)
   let phase = await getPhase();
   const failures = await getConsecutiveFailures();
+  const rotationStatus = await getRotationStatus();
   logger.info(`[${ts()}] [Orchestrator] Resuming — phase: ${phase} | consecutive failures: ${failures}`);
+  logger.info(`[${ts()}] [Orchestrator] Account status — ${rotationStatus.currentEmail} (Account ${rotationStatus.currentAccountIndex + 1}) | sweep: ${rotationStatus.sweepProgress}`);
 
   let cycleCount = 0;
 
@@ -448,6 +451,12 @@ export async function startOrchestrationLoop(callbacks: OrchestratorCallbacks): 
       await runSessionWithRetry(phase, slice, callbacks.runSession);
       sessionSucceeded = true;
       logger.info(`[${ts()}] [Orchestrator] ✓ ${phase} completed (cycle #${cycleCount})`);
+
+      // Check if we should rotate accounts after this session
+      const rotated = await incrementSessionAndCheckRotation();
+      if (rotated) {
+        logger.info(`[${ts()}] [Orchestrator] Account rotation triggered — next session will use new account`);
+      }
     } catch (err: any) {
       logger.error(
         { err: err.message, cycle: cycleCount },

@@ -34,6 +34,7 @@ import {
   startOrchestrationLoop,
   SessionPhase,
 } from './orchestration/session-orchestrator';
+import { getCurrentAccount } from './auth/account-manager';
 
 // 3–4 minute randomized delay between centre changes (Experiment 1 requirement)
 const CENTRE_DELAY_MIN_MS = parseInt(process.env.CENTRE_DELAY_MIN_MS ?? '180000', 10); // 3 min
@@ -70,13 +71,9 @@ async function runSession(phase: SessionPhase, centreSlice: [number, number]): P
   logger.info(`  [${ts()}] [${phase}] Centre delay: ${CENTRE_DELAY_MIN_MS / 1000}s – ${CENTRE_DELAY_MAX_MS / 1000}s`);
   logger.info('═══════════════════════════════════════════════════════');
 
-  // Validate environment variables
-  const email = process.env.VFS_EMAIL ?? '';
-  const password = process.env.VFS_PASSWORD ?? '';
-  if (!email || !password) {
-    logger.error(`[${ts()}] VFS_EMAIL and VFS_PASSWORD must be set`);
-    process.exit(1);
-  }
+  // Get current account credentials (rotates automatically after each full sweep)
+  const { email, password } = await getCurrentAccount();
+  logger.info(`[${ts()}] [${phase}] Using account: ${email}`);
 
   // ------------------------------------------------------------------
   // Chrome launch
@@ -220,6 +217,23 @@ async function runSession(phase: SessionPhase, centreSlice: [number, number]): P
       logger.info('');
       logger.info(`[${ts()}] [${phase}] ── Centre ${i + 1}/${sessionCentres.length}: ${centreName}`);
 
+      // Check for session expiry before polling (catch redirects early)
+      try {
+        const urlCheck = await client.Runtime.evaluate({
+          expression: 'location.pathname',
+          returnByValue: true,
+        });
+        const path = String(urlCheck.result?.value ?? '');
+        if (path.includes('/login') || path.includes('/page-not-found')) {
+          logger.warn(`[${ts()}] [${phase}] ⚠️  Session Expired or Invalid — redirected to ${path}`);
+          throw new Error(`Session expired: redirected to ${path}`);
+        }
+      } catch (err: any) {
+        // If the error is our own throw, re-throw it
+        if (err.message?.includes('Session expired')) throw err;
+        // Otherwise CDP may be briefly disconnected — non-fatal, continue
+      }
+
       await pollSingleCentre(client.Runtime, centre, i + 1, sessionCentres.length);
 
       logger.info(`[${ts()}] [${phase}] ✓ ${centreName} polled`);
@@ -231,16 +245,16 @@ async function runSession(phase: SessionPhase, centreSlice: [number, number]): P
         throw new Error(`Session aborted: ${abortReason}`);
       }
 
-      // Also detect session invalidation via URL (VFS redirects to /login on expiry)
+      // Also detect session invalidation via URL (VFS redirects to /login or /page-not-found on expiry)
       try {
         const urlCheck = await client.Runtime.evaluate({
           expression: 'location.pathname',
           returnByValue: true,
         });
         const path = String(urlCheck.result?.value ?? '');
-        if (path.includes('/login')) {
-          logger.warn(`[${ts()}] [${phase}] ⚠️  Session Expired or Invalid — redirected to login page`);
-          throw new Error('Session expired: redirected to login');
+        if (path.includes('/login') || path.includes('/page-not-found')) {
+          logger.warn(`[${ts()}] [${phase}] ⚠️  Session Expired or Invalid — redirected to ${path}`);
+          throw new Error(`Session expired: redirected to ${path}`);
         }
       } catch (err: any) {
         // If the error is our own throw, re-throw it
