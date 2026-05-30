@@ -16,7 +16,11 @@ import { logger } from '../utils/logger';
 
 export const POLL_USER_DATA_DIR = path.resolve(process.cwd(), 'profiles/main-session');
 
-const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+const CHROME_EXECUTABLE = process.env.CHROME_EXECUTABLE || (
+  process.platform === 'darwin'
+    ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
+    : '/usr/bin/google-chrome'
+);
 const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
 
 // Port 9223 avoids conflict with any existing Chrome instance on 9222
@@ -46,9 +50,15 @@ export async function launchChrome(): Promise<ChildProcess> {
     [
       `--user-data-dir=${POLL_USER_DATA_DIR}`,
       `--remote-debugging-port=${REMOTE_DEBUG_PORT}`,
+      '--no-sandbox',
+      '--disable-setuid-sandbox',
       VFS_LOGIN_URL,
     ],
-    { detached: false, stdio: 'ignore' }
+    {
+      detached: false,
+      stdio: 'ignore',
+      env: { ...process.env, DISPLAY: process.env.DISPLAY || ':99' },
+    }
   );
 
   proc.on('exit', (code, signal) => {
