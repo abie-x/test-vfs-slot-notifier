@@ -104,7 +104,7 @@ async function runSession(phase: SessionPhase, centreSlice: [number, number]): P
     // OTP
     // ------------------------------------------------------------------
     logger.info(`[${ts()}] [${phase}] OTP START — waiting for OTP screen...`);
-    client = await handleOTPScreen(client);
+    client = await handleOTPScreen(client, email, password);
     cdpClient = client;
     logger.info(`[${ts()}] [${phase}] ✓ OTP submitted`);
 

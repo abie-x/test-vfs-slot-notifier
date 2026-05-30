@@ -12,7 +12,7 @@
 
 import Redis from 'ioredis';
 import { logger } from '../utils/logger';
-import { notifyDateChange } from '../services/telegram-notifier';
+import { notifyDateChange, notifyLaterDate } from '../services/telegram-notifier';
 
 // ---------------------------------------------------------------------------
 // Redis client — connection errors are caught and logged; they do not crash
@@ -52,7 +52,7 @@ export interface CentreSlotState {
   lastChecked: string;      // ISO timestamp
 }
 
-export type SlotChangeType = 'appeared' | 'earlier' | 'disappeared' | 'none';
+export type SlotChangeType = 'appeared' | 'earlier' | 'later' | 'disappeared' | 'none';
 
 // ---------------------------------------------------------------------------
 // Core function
@@ -168,7 +168,28 @@ export async function detectSlotChange(
   }
 
   // ---------------------------------------------------------------------------
-  // Case 3: Slots disappeared (had slots before, none now)
+  // Case 3: Date moved later (both had slots, but date moved further out)
+  // The earlier slot is gone — someone booked it. The new date is still
+  // available and worth notifying about for people who missed the earlier one.
+  // ---------------------------------------------------------------------------
+  if (
+    previousState.hasSlots &&
+    currentState.hasSlots &&
+    currentState.earliestDate !== null &&
+    previousState.earliestDate !== null &&
+    currentState.earliestDate > previousState.earliestDate
+  ) {
+    logger.info(
+      `ℹ️  DATE MOVED LATER — ${centreName} | was: ${previousState.earliestDate} → now: ${currentState.earliestDate} | applicants: ${currentState.totalApplicants}`
+    );
+    notifyLaterDate(centreName, previousState.earliestDate, currentState.earliestDate).catch((err) => {
+      logger.warn({ err: err.message }, '[Telegram] notifyLaterDate threw unexpectedly (later)');
+    });
+    return 'later';
+  }
+
+  // ---------------------------------------------------------------------------
+  // Case 4: Slots disappeared (had slots before, none now)
   // ---------------------------------------------------------------------------
   if (previousState.hasSlots && !currentState.hasSlots) {
     logger.info(`ℹ️  Slots gone — ${centreName}`);

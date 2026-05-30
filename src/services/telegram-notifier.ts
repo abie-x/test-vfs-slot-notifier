@@ -195,17 +195,79 @@ export async function notifyDateChange(
 
   const message =
     `🇫🇷 France Appointment Update\n` +
+    `\n` +
     `📍 Centre: ${short}\n` +
     `📅 Previous Date: ${prevFormatted}\n` +
     `✨ New Date: ${newFormatted}\n` +
-    `⏰ ${time} IST`;
+    `\n` +
+    `⏰ ${time} IST\n` +
+    `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
 
   logger.info(`[Telegram] Sending date change notification for ${centreName}: ${previousDate} → ${newDate}`);
 
-  const sent = await sendTelegramMessage(message);
+  const sent = await sendTelegramMessage(message, 'Markdown');
 
   if (sent) {
     // Update deduplication state only on successful send
+    lastNotifiedDate.set(centreName, newDate);
+  }
+}
+
+// ---------------------------------------------------------------------------
+// Later date notification
+// ---------------------------------------------------------------------------
+
+/**
+ * Sends a Telegram notification when the earliest date moves further out.
+ * The previous slot was taken; the new (later) date is still available.
+ *
+ * Suppression rules:
+ *   1. New date is "N/A" or empty → skip
+ *   2. Same centre + same date already notified → skip (deduplication)
+ *
+ * @param centreName   Full VFS centre name
+ * @param previousDate Previous earliest date (raw string)
+ * @param newDate      New (later) earliest date (raw string)
+ */
+export async function notifyLaterDate(
+  centreName: string,
+  previousDate: string,
+  newDate: string
+): Promise<void> {
+  // Rule 1: Skip N/A or empty dates
+  if (!newDate || newDate === 'N/A' || newDate.trim() === '') {
+    logger.info(`[Telegram] Skipped N/A later-date notification for ${centreName}`);
+    return;
+  }
+
+  // Rule 2: Deduplication — skip if we already notified this exact date for this centre
+  const lastDate = lastNotifiedDate.get(centreName);
+  if (lastDate === newDate) {
+    logger.info(`[Telegram] Suppressed duplicate later-date notification for ${centreName} — date unchanged: ${newDate}`);
+    return;
+  }
+
+  const short = shortCentreName(centreName);
+  const prevFormatted = formatDate(previousDate);
+  const newFormatted = formatDate(newDate);
+  const time = istTime();
+
+  const message =
+    `🇫🇷 France Appointment Update\n` +
+    `\n` +
+    `📍 Centre: ${short}\n` +
+    `⚠️ Earlier slot taken — date moved out\n` +
+    `📅 Was: ${prevFormatted}\n` +
+    `📅 Now: ${newFormatted}\n` +
+    `\n` +
+    `⏰ ${time} IST\n` +
+    `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
+
+  logger.info(`[Telegram] Sending later-date notification for ${centreName}: ${previousDate} → ${newDate}`);
+
+  const sent = await sendTelegramMessage(message, 'Markdown');
+
+  if (sent) {
     lastNotifiedDate.set(centreName, newDate);
   }
 }

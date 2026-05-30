@@ -14,6 +14,7 @@ import {
   checkButtonWithRetry,
   waitForOTPField,
   fillOTPField,
+  detectCurrentScreen,
 } from './cdp-helpers';
 
 const BUTTON_SELECTOR = 'button.btn-brand-orange, button[type="submit"]';
@@ -101,7 +102,11 @@ async function retryLoginWithReload(email: string, password: string): Promise<CD
 /**
  * Handle OTP screen and submission
  */
-export async function handleOTPScreen(client: CDPClient): Promise<CDPClient> {
+export async function handleOTPScreen(
+  client: CDPClient,
+  email: string,
+  password: string
+): Promise<CDPClient> {
   const { Runtime } = client;
   
   logger.info('');
@@ -148,7 +153,7 @@ export async function handleOTPScreen(client: CDPClient): Promise<CDPClient> {
   
   if (!clicked) {
     logger.warn('Submit button still disabled — attempting reload retry');
-    return await retryOTPSubmitWithReload(otp);
+    return await retryOTPSubmitWithReload(otp, email, password);
   }
   
   return finalClient!;
@@ -181,39 +186,135 @@ async function fetchOTPWithRetry(): Promise<string | null> {
 }
 
 /**
- * Retry OTP submit with reload
+ * Retry OTP submit with reload.
+ *
+ * After reload, VFS almost always lands back on the login page (OTP screen
+ * is transient and does not survive a reload). We detect which screen we're
+ * on and handle both cases:
+ *
+ *   login screen → run full login flow (fill creds → Turnstile → Sign In)
+ *                  then wait for OTP screen, fetch a fresh OTP, fill & Submit
+ *   otp screen   → re-fill the existing OTP and retry Submit as before
  */
-async function retryOTPSubmitWithReload(otp: string): Promise<CDPClient> {
+async function retryOTPSubmitWithReload(
+  otp: string,
+  email: string,
+  password: string
+): Promise<CDPClient> {
   logger.warn('Reloading page to retry Submit (one time)...');
-  
+
   const client = await connectCDP('vfsglobal.com');
   const { Page, Runtime } = client;
   await Page.enable();
   await Runtime.enable();
-  
+
   await Page.reload();
   await sleep(3000);
-  
-  // Re-fill OTP
-  logger.info({ otp }, 'Re-filling OTP after reload...');
-  await fillOTPField(Runtime, otp);
-  await sleep(2000);
-  
-  // Try Submit again
-  const { clicked, client: newClient } = await checkButtonWithRetry(
-    BUTTON_SELECTOR,
-    'Submit',
-    5,
-    60,
-    2
-  );
-  
-  if (!clicked) {
-    logger.error('Submit still failed after reload — manual intervention required');
-    process.exit(1);
+
+  // Detect which screen we landed on after reload
+  const screen = await detectCurrentScreen(Runtime);
+  logger.info(`[OTP retry] Screen after reload: ${screen}`);
+
+  if (screen === 'login') {
+    // ----------------------------------------------------------------
+    // Reload sent us back to the login page — run the full login flow
+    // ----------------------------------------------------------------
+    logger.warn('[OTP retry] Landed on login screen — re-running login flow');
+
+    await waitForLoginForm(Runtime, 10);
+    await fillLoginCredentials(Runtime, email, password);
+
+    // Disconnect for Turnstile
+    logger.info('[OTP retry] Disconnecting CDP before Turnstile renders...');
+    await client.close();
+    await sleep(TURNSTILE_WAIT_LOGIN);
+
+    // Click Sign In
+    const { clicked: signInClicked, client: signInClient } = await checkButtonWithRetry(
+      BUTTON_SELECTOR,
+      'Sign In',
+      5,
+      60,
+      7
+    );
+
+    if (!signInClicked) {
+      logger.error('[OTP retry] Sign In still failed after reload — manual intervention required');
+      process.exit(1);
+    }
+
+    // Wait for OTP screen
+    logger.info('[OTP retry] Waiting for OTP screen after re-login...');
+    const otpFound = await waitForOTPField(signInClient!.Runtime);
+    if (!otpFound) {
+      logger.error('[OTP retry] OTP screen not found after re-login — manual intervention required');
+      process.exit(1);
+    }
+
+    // Disconnect for OTP Turnstile
+    logger.info('[OTP retry] Disconnecting CDP before OTP Turnstile renders...');
+    await signInClient!.close();
+    await sleep(TURNSTILE_WAIT_OTP);
+
+    // Fetch a fresh OTP — the previous one is now stale
+    logger.info('[OTP retry] Fetching fresh OTP from Gmail...');
+    const freshOtp = await fetchOTPWithRetry();
+    if (!freshOtp) {
+      logger.error('[OTP retry] Could not fetch fresh OTP — manual intervention required');
+      process.exit(1);
+    }
+
+    // Reconnect and fill fresh OTP
+    const otpClient = await connectCDP('vfsglobal.com');
+    await otpClient.Runtime.enable();
+    await fillOTPField(otpClient.Runtime, freshOtp);
+    await sleep(2000);
+
+    // Submit
+    const { clicked: submitClicked, client: finalClient } = await checkButtonWithRetry(
+      BUTTON_SELECTOR,
+      'Submit',
+      5,
+      60,
+      2
+    );
+
+    if (!submitClicked) {
+      logger.error('[OTP retry] Submit still failed after full re-login — manual intervention required');
+      process.exit(1);
+    }
+
+    return finalClient!;
+
+  } else {
+    // ----------------------------------------------------------------
+    // Still on OTP screen — re-fill the existing OTP and retry Submit
+    // ----------------------------------------------------------------
+    logger.info('[OTP retry] Still on OTP screen — re-filling OTP');
+
+    await fillOTPField(Runtime, otp);
+    await sleep(2000);
+
+    // Disconnect for Turnstile before retrying Submit
+    logger.info('[OTP retry] Disconnecting CDP before OTP Turnstile renders...');
+    await client.close();
+    await sleep(TURNSTILE_WAIT_OTP);
+
+    const { clicked, client: newClient } = await checkButtonWithRetry(
+      BUTTON_SELECTOR,
+      'Submit',
+      5,
+      60,
+      2
+    );
+
+    if (!clicked) {
+      logger.error('[OTP retry] Submit still failed after reload — manual intervention required');
+      process.exit(1);
+    }
+
+    return newClient!;
   }
-  
-  return newClient!;
 }
 
 /**
