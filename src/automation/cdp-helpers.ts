@@ -26,15 +26,6 @@ export function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, ms));
 }
 
-/**
- * Sleep with random jitter
- * @param minMs Minimum milliseconds to sleep
- * @param maxMs Maximum milliseconds to sleep
- */
-export function sleepWithJitter(minMs: number, maxMs: number): Promise<void> {
-  const jitter = Math.floor(Math.random() * (maxMs - minMs + 1)) + minMs;
-  return sleep(jitter);
-}
 
 /**
  * Connect to Chrome via CDP with retry logic

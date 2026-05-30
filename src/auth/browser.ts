@@ -157,22 +157,3 @@ async function killProcessOnPort(port: number): Promise<void> {
   }
 }
 
-// ---------------------------------------------------------------------------
-// Legacy export (kept for backward compatibility — not used in Experiment 1)
-// ---------------------------------------------------------------------------
-
-/**
- * @deprecated Use launchChrome() + shutdownChrome() instead.
- */
-export function openChromeWithDebugging(): ReturnType<typeof spawn> {
-  logger.info('[Browser] Opening Chrome with remote debugging port...');
-
-  const proc = spawn(CHROME_EXECUTABLE, [
-    `--user-data-dir=${POLL_USER_DATA_DIR}`,
-    `--remote-debugging-port=${REMOTE_DEBUG_PORT}`,
-    VFS_LOGIN_URL,
-  ], { detached: false, stdio: 'ignore' });
-
-  logger.info({ pid: proc.pid, debugPort: REMOTE_DEBUG_PORT }, '✓ Chrome opened for polling');
-  return proc;
-}

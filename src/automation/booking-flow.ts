@@ -2,7 +2,6 @@
  * Booking Flow Automation
  * Handles booking page navigation and slot polling.
  *
- * Experiment 1: startMultiCentrePolling (infinite loop) has been removed.
  * The orchestrator in session-orchestrator.ts drives a single-pass poll
  * per session via pollSingleCentre() called directly from index.ts.
  */
@@ -217,89 +216,4 @@ export async function pollSingleCentre(
   await sleep(2500);
 }
 
-/**
- * Start multi-centre polling loop
- * @deprecated Not used in Experiment 1. The orchestrator drives single-pass
- * polling via pollSingleCentre() called directly from index.ts.
- */
-export async function startMultiCentrePolling(
-  Runtime: any,
-  centres: CentreConfig[],
-  minIntervalMs: number,
-  maxIntervalMs: number,
-  onPollComplete: (round: number, centreIndex: number, centreName: string) => void
-): Promise<void> {
-  let pollRound = 0;
-  
-  logger.info('✓ Multi-centre polling active — press Ctrl+C to stop');
-  logger.info(`✓ Monitoring ${centres.length} centres with ${minIntervalMs / 1000}s-${maxIntervalMs / 1000}s randomized interval`);
-  
-  while (true) {
-    pollRound++;
-    logger.info('');
-    logger.info('═══════════════════════════════════════════════════════');
-    logger.info(`  POLL ROUND #${pollRound} - Checking ${centres.length} centres`);
-    logger.info('═══════════════════════════════════════════════════════');
-    
-    for (let i = 0; i < centres.length; i++) {
-      const centre = centres[i];
-      
-      // Extract short name for tracking
-      let centreName = centre.name;
-      if (centreName.includes('France Visa Application Centre,')) {
-        centreName = centreName.replace('France Visa Application Centre,', '').trim();
-      } else if (centreName.includes('France Visa Application Centre')) {
-        centreName = centreName.replace('France Visa Application Centre', '').trim();
-      } else if (centreName.includes('France Temporary Enrolment Centre-')) {
-        centreName = centreName.replace('France Temporary Enrolment Centre-', '').trim();
-      }
-      
-      // Set centre name BEFORE polling so the network handler reads the correct name
-      onPollComplete(pollRound, i + 1, centreName);
-      
-      await pollSingleCentre(Runtime, centre, i + 1, centres.length);
-      
-      // Wait between centres with jitter (except after last centre)
-      if (i < centres.length - 1) {
-        const waitTime = Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1)) + minIntervalMs;
-        logger.info(`Waiting ${(waitTime / 1000).toFixed(1)}s before next centre...`);
-        await sleep(waitTime);
-      }
-    }
-    
-    const now = new Date().toLocaleTimeString('en-IN', { hour: '2-digit', minute: '2-digit', second: '2-digit' });
-    logger.info('');
-    logger.info('═══════════════════════════════════════════════════════');
-    logger.info(`  [${now}] ✓ Round #${pollRound} complete - checked ${centres.length} centres`);
-    logger.info('═══════════════════════════════════════════════════════');
-    
-    // Wait before starting next round with jitter
-    const roundWaitTime = Math.floor(Math.random() * (maxIntervalMs - minIntervalMs + 1)) + minIntervalMs;
-    logger.info(`Waiting ${(roundWaitTime / 1000).toFixed(1)}s before next round...`);
-    await sleep(roundWaitTime);
-  }
-}
 
-/**
- * Start polling loop
- * @deprecated Not used in Experiment 1.
- */
-export async function startPollingLoop(
-  Runtime: any,
-  subCategories: string[],
-  pollIntervalMs: number,
-  onPoll: (category: string) => void
-): Promise<void> {
-  logger.info('✓ Polling active — press Ctrl+C to stop');
-  
-  let subCatIndex = 0;
-  
-  while (true) {
-    await sleep(pollIntervalMs);
-    subCatIndex = (subCatIndex + 1) % subCategories.length;
-    const category = subCategories[subCatIndex];
-    
-    onPoll(category);
-    await selectSubCategory(Runtime, category);
-  }
-}

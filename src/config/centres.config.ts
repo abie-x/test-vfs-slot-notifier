@@ -133,9 +133,4 @@ export const CENTRES: CentreConfig[] = [
   },
 ];
 
-/**
- * Get centre by name (for validation)
- */
-export function getCentreByName(name: string): CentreConfig | undefined {
-  return CENTRES.find(c => c.name === name);
-}
+
