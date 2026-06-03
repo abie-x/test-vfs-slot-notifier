@@ -47,33 +47,13 @@ function istTime(): string {
 }
 
 /**
- * Formats a raw date string into a readable form like "12 Jun 2026".
- * Falls back to the raw string if parsing fails.
- *
- * Handles two formats from the VFS API:
- *   - "MM/DD/YYYY HH:MM:SS"  e.g. "06/12/2026 00:00:00"
- *   - "YYYY-MM-DD"           e.g. "2026-06-12"
- *
- * Dates are parsed as UTC to avoid timezone shifts (e.g. midnight IST
- * rolling back to the previous day when converted to UTC).
+ * Formats a raw date string (e.g. "2026-05-27") into a readable form
+ * like "27 May 2026". Falls back to the raw string if parsing fails.
  */
 function formatDate(raw: string): string {
   try {
-    let isoString: string;
-
-    // Match "MM/DD/YYYY HH:MM:SS" or "MM/DD/YYYY"
-    const mdyMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
-    if (mdyMatch) {
-      // Reconstruct as an explicit UTC ISO string so Date() never applies local offset
-      isoString = `${mdyMatch[3]}-${mdyMatch[1]}-${mdyMatch[2]}T00:00:00Z`;
-    } else {
-      // Assume YYYY-MM-DD — append Z to force UTC interpretation
-      isoString = raw.includes('T') ? raw : `${raw.split(' ')[0]}T00:00:00Z`;
-    }
-
-    const d = new Date(isoString);
+    const d = new Date(raw);
     if (isNaN(d.getTime())) return raw;
-
     return d.toLocaleDateString('en-GB', {
       day: '2-digit',
       month: 'short',
