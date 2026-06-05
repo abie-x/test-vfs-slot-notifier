@@ -22,6 +22,7 @@ import { logger } from '../utils/logger';
 
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? '';
+const OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID ?? '';
 
 // ---------------------------------------------------------------------------
 // Deduplication state
@@ -47,18 +48,29 @@ function istTime(): string {
 }
 
 /**
- * Formats a raw date string (e.g. "2026-05-27") into a readable form
- * like "27 May 2026". Falls back to the raw string if parsing fails.
+ * Formats a raw date string from VFS API (e.g. "06/20/2026 00:00:00" or "2026-05-27")
+ * into a readable form like "20 Jun 2026".
+ * Displays in IST to avoid timezone-shift off-by-one errors.
+ * Falls back to the raw string if parsing fails.
  */
 function formatDate(raw: string): string {
   try {
-    const d = new Date(raw);
+    // VFS returns dates as "MM/DD/YYYY HH:MM:SS" — parse explicitly to avoid
+    // JavaScript's ambiguous date parsing behaviour
+    let d: Date;
+    const mmddyyyy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+    if (mmddyyyy) {
+      // Parse as "YYYY-MM-DD" which is unambiguous in JS
+      d = new Date(`${mmddyyyy[3]}-${mmddyyyy[1]}-${mmddyyyy[2]}T00:00:00+05:30`);
+    } else {
+      d = new Date(raw);
+    }
     if (isNaN(d.getTime())) return raw;
     return d.toLocaleDateString('en-GB', {
       day: '2-digit',
       month: 'short',
       year: 'numeric',
-      timeZone: 'UTC',
+      timeZone: 'Asia/Kolkata',
     });
   } catch {
     return raw;
@@ -198,7 +210,7 @@ export async function notifyDateChange(
     `\n` +
     `📍 Centre: ${short}\n` +
     `📅 Previous Date: ${prevFormatted}\n` +
-    `✨ New Date: ${newFormatted}\n` +
+    `✨ New Date: *${newFormatted}*\n` +
     `\n` +
     `⏰ ${time} IST\n` +
     `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
@@ -258,7 +270,7 @@ export async function notifyLaterDate(
     `📍 Centre: ${short}\n` +
     `⚠️ Earlier slot taken — date moved out\n` +
     `📅 Was: ${prevFormatted}\n` +
-    `📅 Now: ${newFormatted}\n` +
+    `📅 Now: *${newFormatted}*\n` +
     `\n` +
     `⏰ ${time} IST\n` +
     `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
@@ -270,6 +282,136 @@ export async function notifyLaterDate(
   if (sent) {
     lastNotifiedDate.set(centreName, newDate);
   }
+}
+
+// ---------------------------------------------------------------------------
+// Owner DM — private notifications to bot operator only
+// ---------------------------------------------------------------------------
+
+/**
+ * Sends a message directly to the bot owner's personal Telegram chat.
+ * Uses TELEGRAM_OWNER_CHAT_ID instead of the group TELEGRAM_CHAT_ID.
+ * Never throws.
+ */
+async function sendOwnerMessage(text: string): Promise<boolean> {
+  if (!BOT_TOKEN) {
+    logger.warn('[Telegram] TELEGRAM_BOT_TOKEN is not set — skipping owner DM');
+    return false;
+  }
+  if (!OWNER_CHAT_ID) {
+    logger.warn('[Telegram] TELEGRAM_OWNER_CHAT_ID is not set — skipping owner DM');
+    return false;
+  }
+
+  const payload = JSON.stringify({
+    chat_id: OWNER_CHAT_ID,
+    text,
+    parse_mode: 'Markdown',
+  });
+
+  return new Promise((resolve) => {
+    const options: https.RequestOptions = {
+      hostname: 'api.telegram.org',
+      path: `/bot${BOT_TOKEN}/sendMessage`,
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Content-Length': Buffer.byteLength(payload),
+      },
+    };
+
+    const req = https.request(options, (res) => {
+      let body = '';
+      res.on('data', (chunk) => (body += chunk));
+      res.on('end', () => {
+        if (res.statusCode === 200) {
+          logger.info('[Telegram] ✓ Owner DM sent successfully');
+          resolve(true);
+        } else {
+          logger.error(
+            { statusCode: res.statusCode, body },
+            '[Telegram] ✗ Owner DM failed — non-200 response'
+          );
+          resolve(false);
+        }
+      });
+    });
+
+    req.on('error', (err) => {
+      logger.error({ err: err.message }, '[Telegram] ✗ Owner DM failed — network error');
+      resolve(false);
+    });
+
+    req.setTimeout(10000, () => {
+      logger.error('[Telegram] ✗ Owner DM failed — request timed out after 10s');
+      req.destroy();
+      resolve(false);
+    });
+
+    req.write(payload);
+    req.end();
+  });
+}
+
+/**
+ * Notifies the bot owner (private DM) that a VFS account has been blocked
+ * with a 429001 "Access Restricted" error.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param blockedEmail   The email address of the blocked account
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+export async function notifyOwnerAccountBlocked(
+  blockedEmail: string,
+  nextEmail: string,
+  cooldownMinutes: number
+): Promise<void> {
+  const time = istTime();
+
+  const message =
+    `🚫 *VFS Account Blocked (429001)*\n` +
+    `\n` +
+    `⛔ Blocked: \`${blockedEmail}\`\n` +
+    `✅ Rotated to: \`${nextEmail}\`\n` +
+    `\n` +
+    `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+    `⏰ ${time} IST`;
+
+  logger.warn(`[Telegram] Sending account-blocked owner DM for ${blockedEmail}`);
+  await sendOwnerMessage(message);
+}
+
+/**
+ * Notifies the bot owner (private DM) that OTP was not received after all
+ * retry attempts. Account has been rotated as a precaution.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param timedOutEmail  The email address that did not receive the OTP
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+export async function notifyOwnerOtpTimeout(
+  timedOutEmail: string,
+  nextEmail: string,
+  cooldownMinutes: number
+): Promise<void> {
+  const time = istTime();
+
+  const message =
+    `⏱️ *OTP Timeout — Account Rotated*\n` +
+    `\n` +
+    `📭 No OTP received for: \`${timedOutEmail}\`\n` +
+    `✅ Rotated to: \`${nextEmail}\`\n` +
+    `\n` +
+    `⚠️ Possible cause: VFS may have flagged this account\n` +
+    `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+    `⏰ ${time} IST`;
+
+  logger.warn(`[Telegram] Sending OTP timeout owner DM for ${timedOutEmail}`);
+  await sendOwnerMessage(message);
 }
 
 // ---------------------------------------------------------------------------

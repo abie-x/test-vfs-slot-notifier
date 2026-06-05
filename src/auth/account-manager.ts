@@ -57,6 +57,17 @@ redis.connect().catch(() => {
   // Error already logged by the 'error' event above
 });
 
+/**
+ * Wait for Redis connection to be ready (max 3s).
+ * Falls through silently if Redis is unavailable.
+ */
+async function waitForRedisReady(): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    if (redis.status === 'ready') return;
+    await new Promise((r) => setTimeout(r, 300));
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Account credentials
 // ---------------------------------------------------------------------------
@@ -67,18 +78,19 @@ interface AccountCredentials {
 }
 
 /**
- * Get both account credentials from environment variables.
+ * Get all account credentials from environment variables.
  * Throws if any required variable is missing.
  */
-function getAccountCredentials(): [AccountCredentials, AccountCredentials, AccountCredentials] {
+function getAccountCredentials(): [AccountCredentials, AccountCredentials, AccountCredentials, AccountCredentials] {
   const email1 = process.env.VFS_EMAIL_ACCOUNT1;
   const email2 = process.env.VFS_EMAIL_ACCOUNT2;
   const email3 = process.env.VFS_EMAIL_ACCOUNT3;
+  const email4 = process.env.VFS_EMAIL_ACCOUNT4;
   const password = process.env.VFS_PASSWORD;
 
-  if (!email1 || !email2 || !email3 || !password) {
+  if (!email1 || !email2 || !email3 || !email4 || !password) {
     throw new Error(
-      'Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, VFS_EMAIL_ACCOUNT3, and VFS_PASSWORD must all be set'
+      'Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, VFS_EMAIL_ACCOUNT3, VFS_EMAIL_ACCOUNT4, and VFS_PASSWORD must all be set'
     );
   }
 
@@ -86,6 +98,7 @@ function getAccountCredentials(): [AccountCredentials, AccountCredentials, Accou
     { email: email1, password },
     { email: email2, password },
     { email: email3, password },
+    { email: email4, password },
   ];
 }
 
@@ -94,7 +107,7 @@ function getAccountCredentials(): [AccountCredentials, AccountCredentials, Accou
 // ---------------------------------------------------------------------------
 
 /**
- * Get current account index (0, 1, or 2).
+ * Get current account index (0, 1, 2, or 3).
  * Defaults to 0 if not set.
  */
 async function getCurrentAccountIndex(): Promise<number> {
@@ -102,7 +115,7 @@ async function getCurrentAccountIndex(): Promise<number> {
     const raw = await redis.get(REDIS_KEY_CURRENT_INDEX);
     if (raw !== null) {
       const parsed = parseInt(raw, 10);
-      if (parsed >= 0 && parsed <= 2) return parsed;
+      if (parsed >= 0 && parsed <= 3) return parsed;
     }
   } catch {
     // Redis unavailable — default to account 0
@@ -156,9 +169,10 @@ async function setSweepCount(count: number): Promise<void> {
  * Returns { email, password } for the current account.
  */
 export async function getCurrentAccount(): Promise<AccountCredentials> {
-  const [account1, account2, account3] = getAccountCredentials();
+  await waitForRedisReady();
+  const accounts = getAccountCredentials();
   const index = await getCurrentAccountIndex();
-  const account = index === 0 ? account1 : index === 1 ? account2 : account3;
+  const account = accounts[index];
 
   logger.info(`[${ts()}] [AccountManager] Using account ${index + 1}: ${account.email}`);
   return account;
@@ -177,15 +191,14 @@ export async function incrementSessionAndCheckRotation(): Promise<boolean> {
   logger.info(`[${ts()}] [AccountManager] Session completed — sweep progress: ${newSweepCount}/${SESSIONS_PER_SWEEP}`);
 
   if (newSweepCount >= SESSIONS_PER_SWEEP) {
-    // Full sweep completed — rotate to next account (0 → 1 → 2 → 0)
+    // Full sweep completed — rotate to next account (0 → 1 → 2 → 3 → 0)
     const currentIndex = await getCurrentAccountIndex();
-    const newIndex = (currentIndex + 1) % 3;
+    const newIndex = (currentIndex + 1) % 4;
 
     await setCurrentAccountIndex(newIndex);
     await setSweepCount(0);
 
-    const [account1, account2, account3] = getAccountCredentials();
-    const accounts = [account1, account2, account3];
+    const accounts = getAccountCredentials();
     const newAccount = accounts[newIndex];
 
     logger.info('');
@@ -212,8 +225,8 @@ export async function getRotationStatus(): Promise<{
   currentEmail: string;
   sweepProgress: string;
 }> {
-  const [account1, account2, account3] = getAccountCredentials();
-  const accounts = [account1, account2, account3];
+  await waitForRedisReady();
+  const accounts = getAccountCredentials();
   const index = await getCurrentAccountIndex();
   const sweepCount = await getSweepCount();
   const currentEmail = accounts[index].email;
@@ -223,4 +236,31 @@ export async function getRotationStatus(): Promise<{
     currentEmail,
     sweepProgress: `${sweepCount}/${SESSIONS_PER_SWEEP} sessions`,
   };
+}
+
+/**
+ * Force-rotate to the next account immediately when a 429001 block is detected.
+ * Does NOT touch sweep_count — the new account continues from the current sweep
+ * progress and rotates normally after its own full sweep.
+ *
+ * Returns the email of the newly active account.
+ */
+export async function forceRotateOnBlock(blockedEmail: string): Promise<string> {
+  const currentIndex = await getCurrentAccountIndex();
+  const newIndex = (currentIndex + 1) % 4;
+
+  await setCurrentAccountIndex(newIndex);
+
+  const accounts = getAccountCredentials();
+  const newAccount = accounts[newIndex];
+
+  logger.warn('');
+  logger.warn('═══════════════════════════════════════════════════════');
+  logger.warn(`  [${ts()}] [AccountManager] FORCE ROTATION (429001 BLOCK)`);
+  logger.warn(`  [${ts()}] [AccountManager] Blocked account: ${blockedEmail}`);
+  logger.warn(`  [${ts()}] [AccountManager] Switching: Account ${currentIndex + 1} → Account ${newIndex + 1}`);
+  logger.warn(`  [${ts()}] [AccountManager] Next login will use: ${newAccount.email}`);
+  logger.warn('═══════════════════════════════════════════════════════');
+
+  return newAccount.email;
 }

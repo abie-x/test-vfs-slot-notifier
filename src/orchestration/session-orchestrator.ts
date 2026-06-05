@@ -27,7 +27,9 @@ import { execSync } from 'child_process';
 import { logger } from '../utils/logger';
 import { sleep } from '../automation/cdp-helpers';
 import { REMOTE_DEBUG_PORT } from '../auth/browser';
-import { incrementSessionAndCheckRotation, getRotationStatus } from '../auth/account-manager';
+import { incrementSessionAndCheckRotation, getRotationStatus, forceRotateOnBlock } from '../auth/account-manager';
+import { notifyOwnerAccountBlocked, notifyOwnerOtpTimeout } from '../services/telegram-notifier';
+import { AccountBlockedError, OtpTimeoutError } from '../automation/login-flow';
 
 // ---------------------------------------------------------------------------
 // Timestamp helper — IST [HH:MM:SS]
@@ -64,6 +66,9 @@ const EXTENDED_COOLDOWN_MS = parseInt(process.env.SESSION_EXTENDED_COOLDOWN_MS ?
 /** How many consecutive failures before switching to extended cooldown */
 const FAILURE_THRESHOLD = 3;
 
+/** Cooldown applied when an account is blocked (429001 Access Restricted) — 30 minutes */
+const ACCOUNT_BLOCK_COOLDOWN_MS = parseInt(process.env.ACCOUNT_BLOCK_COOLDOWN_MS ?? '1800000', 10);
+
 /** How long to wait between the first attempt and the retry (ms) */
 const RETRY_DELAY_MS = 30_000; // 30 seconds
 
@@ -84,6 +89,21 @@ redis.on('error', (err) => {
 redis.connect().catch(() => {
   // Error already logged by the 'error' event above
 });
+
+/**
+ * Wait for the Redis connection to be ready before proceeding.
+ * Retries up to 10 times with 300ms gaps (3s total max wait).
+ * Falls through silently if Redis is unavailable — bot continues without persistence.
+ */
+async function waitForRedisReady(): Promise<void> {
+  for (let i = 0; i < 10; i++) {
+    if (redis.status === 'ready') return;
+    await sleep(300);
+  }
+  if (redis.status !== 'ready') {
+    logger.warn('[Orchestrator] Redis not ready after 3s — continuing without guaranteed state persistence');
+  }
+}
 
 // ---------------------------------------------------------------------------
 // State helpers
@@ -229,6 +249,30 @@ async function startCooldown(): Promise<void> {
   logger.info('═══════════════════════════════════════════════════════');
 }
 
+/**
+ * Start a fixed 30-minute cooldown specifically for account block events.
+ * Independent of the normal consecutive-failure cooldown logic.
+ */
+async function startAccountBlockCooldown(): Promise<void> {
+  const cooldownUntil = Date.now() + ACCOUNT_BLOCK_COOLDOWN_MS;
+  await setCooldownUntil(cooldownUntil);
+
+  const endTime = new Date(cooldownUntil).toLocaleTimeString('en-IN', {
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+    hour12: false,
+    timeZone: 'Asia/Kolkata',
+  });
+
+  logger.warn('');
+  logger.warn('═══════════════════════════════════════════════════════');
+  logger.warn(`  [${ts()}] [Orchestrator] ACCOUNT BLOCK COOLDOWN — ${ACCOUNT_BLOCK_COOLDOWN_MS / 60000} min`);
+  logger.warn(`  [${ts()}] [Orchestrator] Next session launches at: ${endTime}`);
+  logger.warn(`  [${ts()}] [Orchestrator] Chrome is fully shut down`);
+  logger.warn('═══════════════════════════════════════════════════════');
+}
+
 // ---------------------------------------------------------------------------
 // Phase transition
 // ---------------------------------------------------------------------------
@@ -308,6 +352,17 @@ async function runSessionWithRetry(
     logger.info(`[${ts()}] [Orchestrator] ${phase} — attempt 1 succeeded`);
     return;
   } catch (err: any) {
+    // Account blocked — no retry, rotate immediately and hand off to caller
+    if (err instanceof AccountBlockedError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — account blocked (429001), skipping retry`);
+      throw err;
+    }
+    // OTP timeout — no retry, rotate and hand off to caller
+    if (err instanceof OtpTimeoutError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — OTP timeout, skipping retry`);
+      throw err;
+    }
+
     logger.error(
       { err: err.message },
       `[${ts()}] [Orchestrator] ${phase} attempt 1 FAILED — waiting ${RETRY_DELAY_MS / 1000}s then retrying`
@@ -327,6 +382,17 @@ async function runSessionWithRetry(
     logger.info(`[${ts()}] [Orchestrator] ${phase} — attempt 2 succeeded`);
     return;
   } catch (err: any) {
+    // Account blocked on retry too — rotate and hand off
+    if (err instanceof AccountBlockedError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — account blocked (429001) on retry`);
+      throw err;
+    }
+    // OTP timeout on retry — rotate and hand off
+    if (err instanceof OtpTimeoutError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — OTP timeout on retry`);
+      throw err;
+    }
+
     const failures = await incrementConsecutiveFailures();
     logger.error(
       { err: err.message, consecutiveFailures: failures },
@@ -417,6 +483,10 @@ export async function startOrchestrationLoop(callbacks: OrchestratorCallbacks): 
   // Install process-level safety net (never silently die)
   installProcessSafetyNet();
 
+  // Wait for Redis to be ready before reading persisted state
+  await waitForRedisReady();
+  logger.info(`[${ts()}] [Orchestrator] Redis status: ${redis.status}`);
+
   // Kill any stale Chrome from a previous crash
   await cleanupStaleChrome();
 
@@ -458,6 +528,59 @@ export async function startOrchestrationLoop(callbacks: OrchestratorCallbacks): 
         logger.info(`[${ts()}] [Orchestrator] Account rotation triggered — next session will use new account`);
       }
     } catch (err: any) {
+      // ── Account blocked (429001) ─────────────────────────────────────────
+      if (err instanceof AccountBlockedError) {
+        const blockedEmail = err.message.replace('ACCOUNT_BLOCKED_429001: ', '');
+        logger.warn(`[${ts()}] [Orchestrator] Account blocked — force-rotating and entering 30-min cooldown`);
+
+        const nextEmail = await forceRotateOnBlock(blockedEmail);
+
+        // Notify owner via personal DM
+        notifyOwnerAccountBlocked(blockedEmail, nextEmail, ACCOUNT_BLOCK_COOLDOWN_MS / 60000).catch((e) => {
+          logger.warn({ err: e.message }, '[Orchestrator] Owner DM failed — non-fatal');
+        });
+
+        // Transition phase normally (continue from current phase with new account)
+        const next = nextPhase(phase);
+        await setPhase(next);
+        logger.info(`[${ts()}] [Orchestrator] PHASE TRANSITION: ${phase} → ${next}`);
+
+        // Enter 30-min account-block cooldown
+        await startAccountBlockCooldown();
+        await waitForCooldown();
+
+        logger.info(`[${ts()}] [Orchestrator] NEXT SESSION LAUNCH — ${next} (new account)`);
+        phase = next;
+        continue;
+      }
+
+      // ── OTP timeout ───────────────────────────────────────────────────────
+      if (err instanceof OtpTimeoutError) {
+        const timedOutEmail = err.message.replace('OTP_TIMEOUT: ', '');
+        logger.warn(`[${ts()}] [Orchestrator] OTP timeout — force-rotating and entering 30-min cooldown`);
+
+        const nextEmail = await forceRotateOnBlock(timedOutEmail);
+
+        // Notify owner via personal DM
+        notifyOwnerOtpTimeout(timedOutEmail, nextEmail, ACCOUNT_BLOCK_COOLDOWN_MS / 60000).catch((e) => {
+          logger.warn({ err: e.message }, '[Orchestrator] Owner DM failed — non-fatal');
+        });
+
+        // Transition phase normally
+        const next = nextPhase(phase);
+        await setPhase(next);
+        logger.info(`[${ts()}] [Orchestrator] PHASE TRANSITION: ${phase} → ${next}`);
+
+        // Enter 30-min cooldown (same as account block)
+        await startAccountBlockCooldown();
+        await waitForCooldown();
+
+        logger.info(`[${ts()}] [Orchestrator] NEXT SESSION LAUNCH — ${next} (new account)`);
+        phase = next;
+        continue;
+      }
+
+      // ── Normal failure ────────────────────────────────────────────────────
       logger.error(
         { err: err.message, cycle: cycleCount },
         `[${ts()}] [Orchestrator] ${phase} failed after retry — entering cooldown`

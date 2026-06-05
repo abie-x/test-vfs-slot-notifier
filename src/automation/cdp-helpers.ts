@@ -340,17 +340,25 @@ export async function selectSubCategory(Runtime: any, optionText: string): Promi
 /**
  * Detect current screen type
  */
-export async function detectCurrentScreen(Runtime: any): Promise<'login' | 'otp' | 'dashboard' | 'unknown'> {
+export async function detectCurrentScreen(Runtime: any): Promise<'login' | 'otp' | 'dashboard' | 'blocked_429001' | 'unknown'> {
   const screenCheck = await Runtime.evaluate({
     expression: `
       (() => {
         const url = location.href;
+        const bodyText = document.body.innerText ?? '';
         const hasEmailField = !!document.querySelector('#email');
         const hasOtpField = !!Array.from(document.querySelectorAll('input')).find(el =>
           el.placeholder?.includes('*') || el.type === 'password'
         );
-        const hasDashboard = url.includes('application-detail') || document.body.innerText.includes('Start New Booking');
-        
+        const hasDashboard = url.includes('application-detail') || bodyText.includes('Start New Booking');
+
+        // VFS account-level block: "Access Restricted for User ID (429001)"
+        const isBlocked =
+          bodyText.includes('429001') ||
+          bodyText.includes('Access Restricted for User ID') ||
+          (url.includes('page-not-found') && bodyText.includes('429'));
+
+        if (isBlocked) return 'blocked_429001';
         if (hasEmailField) return 'login';
         if (hasOtpField) return 'otp';
         if (hasDashboard) return 'dashboard';
