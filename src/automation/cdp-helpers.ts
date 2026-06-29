@@ -115,10 +115,35 @@ export async function checkButtonWithRetry(
 ): Promise<{ clicked: boolean; client: CDPClient | null }> {
   logger.info(`Checking ${buttonName} button (disconnect/reconnect cycle, up to ${maxChecks * disconnectInterval + initialWait}s)...`);
   
+  // URL patterns that indicate a dead/error page — no point polling on these
+  const DEAD_PAGE_PATTERNS = [
+    'page-not-found',
+    '502',
+    '503',
+    '504',
+    'error',
+    'unavailable',
+    'maintenance',
+  ];
+
   for (let checkNum = 1; checkNum <= maxChecks; checkNum++) {
     logger.info(`Reconnecting CDP for check #${checkNum}...`);
     const client = await connectCDP('vfsglobal.com');
     await client.Runtime.enable();
+
+    // ── Guard: bail immediately if we're on an error/dead page ──────────
+    const urlResult = await client.Runtime.evaluate({
+      expression: 'location.href',
+      returnByValue: true,
+    });
+    const currentUrl = String(urlResult.result?.value ?? '');
+    const isDeadPage = DEAD_PAGE_PATTERNS.some((p) => currentUrl.includes(p));
+    if (isDeadPage) {
+      logger.warn(`[Check #${checkNum}] Dead/error page detected — aborting button poll (url: ${currentUrl})`);
+      await client.close();
+      return { clicked: false, client: null };
+    }
+    // ────────────────────────────────────────────────────────────────────
     
     const btnResult = await client.Runtime.evaluate({
       expression: `
@@ -174,17 +199,32 @@ export async function waitForOTPField(Runtime: any, maxAttempts = 30): Promise<b
     const check = await Runtime.evaluate({
       expression: `
         (() => {
+          const bodyText = document.body.innerText ?? '';
+          const url = location.href;
+          // Bail out early if VFS shows a block page (429001 or 429002)
+          const isBlocked =
+            bodyText.includes('429001') ||
+            bodyText.includes('Access Restricted for User ID') ||
+            bodyText.includes('429002') ||
+            bodyText.includes('Unauthorised Activity') ||
+            (url.includes('page-not-found') && bodyText.includes('429'));
+          if (isBlocked) return 'blocked';
           const inputs = document.querySelectorAll('input');
           const otpInput = Array.from(inputs).find(el =>
             el.placeholder?.includes('*') ||
-            document.body.innerText.includes('one time password')
+            bodyText.includes('one time password')
           );
-          return !!otpInput;
+          return otpInput ? 'found' : 'waiting';
         })()
       `,
       returnByValue: true,
     });
-    if (check.result?.value === true) {
+    const result = check.result?.value;
+    if (result === 'blocked') {
+      logger.warn('⚠️  VFS block page detected while waiting for OTP screen (429002/429001)');
+      return false;
+    }
+    if (result === 'found') {
       logger.info('✓ OTP screen detected');
       return true;
     }
@@ -352,10 +392,12 @@ export async function detectCurrentScreen(Runtime: any): Promise<'login' | 'otp'
         );
         const hasDashboard = url.includes('application-detail') || bodyText.includes('Start New Booking');
 
-        // VFS account-level block: "Access Restricted for User ID (429001)"
+        // VFS account-level block: "Access Restricted for User ID (429001)" or "Unauthorised Activity (429002)"
         const isBlocked =
           bodyText.includes('429001') ||
           bodyText.includes('Access Restricted for User ID') ||
+          bodyText.includes('429002') ||
+          bodyText.includes('Unauthorised Activity') ||
           (url.includes('page-not-found') && bodyText.includes('429'));
 
         if (isBlocked) return 'blocked_429001';

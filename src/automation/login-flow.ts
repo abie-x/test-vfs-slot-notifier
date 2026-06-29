@@ -25,6 +25,14 @@ export class AccountBlockedError extends Error {
   }
 }
 
+/** Thrown when VFS shows "Access Denied Due to Unauthorised Activity (429002)" after Sign In */
+export class UnauthorisedActivityError extends Error {
+  constructor(email: string) {
+    super(`UNAUTHORISED_ACTIVITY_429002: ${email}`);
+    this.name = 'UnauthorisedActivityError';
+  }
+}
+
 /** Thrown when OTP is not received from Gmail after all retry attempts */
 export class OtpTimeoutError extends Error {
   constructor(email: string) {
@@ -80,22 +88,25 @@ export async function performLogin(
   logger.info('Waiting for post-Sign In redirect...');
   await sleep(4000);
 
-  // Detect if VFS blocked this account (429001 Access Restricted)
+  // Detect if VFS blocked this account (429001 Access Restricted / 429002 Unauthorised Activity)
   const postSignInScreen = await newClient!.Runtime.evaluate({
     expression: `
       (() => {
         const bodyText = document.body.innerText ?? '';
         const url = location.href;
-        return {
-          isBlocked: bodyText.includes('429001') || bodyText.includes('Access Restricted for User ID') || (url.includes('page-not-found') && bodyText.includes('429')),
-          url,
-        };
+        const is429002 = bodyText.includes('429002') || bodyText.includes('Unauthorised Activity');
+        const is429001 = bodyText.includes('429001') || bodyText.includes('Access Restricted for User ID') || (url.includes('page-not-found') && bodyText.includes('429'));
+        return { is429001, is429002, url };
       })()
     `,
     returnByValue: true,
   });
-  const postSignIn = postSignInScreen.result?.value as { isBlocked: boolean; url: string } | null;
-  if (postSignIn?.isBlocked) {
+  const postSignIn = postSignInScreen.result?.value as { is429001: boolean; is429002: boolean; url: string } | null;
+  if (postSignIn?.is429002) {
+    logger.warn(`[Login] ⚠️  Unauthorised Activity (429002) — URL: ${postSignIn.url}`);
+    throw new UnauthorisedActivityError(email);
+  }
+  if (postSignIn?.is429001) {
     logger.warn(`[Login] ⚠️  Account blocked (429001) — URL: ${postSignIn.url}`);
     throw new AccountBlockedError(email);
   }
@@ -132,29 +143,32 @@ async function retryLoginWithReload(email: string, password: string): Promise<CD
   );
   
   if (!clicked) {
-    logger.error('Sign In still failed after reload — manual intervention required');
-    process.exit(1);
+    logger.error('Sign In still failed after reload — throwing for orchestrator to handle');
+    throw new Error('LOGIN_FAILED_AFTER_RELOAD');
   }
 
   // Wait briefly for VFS to process the login and redirect
   await sleep(4000);
 
-  // Detect if VFS blocked this account (429001 Access Restricted)
+  // Detect if VFS blocked this account (429001 Access Restricted / 429002 Unauthorised Activity)
   const postSignInScreen = await newClient!.Runtime.evaluate({
     expression: `
       (() => {
         const bodyText = document.body.innerText ?? '';
         const url = location.href;
-        return {
-          isBlocked: bodyText.includes('429001') || bodyText.includes('Access Restricted for User ID') || (url.includes('page-not-found') && bodyText.includes('429')),
-          url,
-        };
+        const is429002 = bodyText.includes('429002') || bodyText.includes('Unauthorised Activity');
+        const is429001 = bodyText.includes('429001') || bodyText.includes('Access Restricted for User ID') || (url.includes('page-not-found') && bodyText.includes('429'));
+        return { is429001, is429002, url };
       })()
     `,
     returnByValue: true,
   });
-  const postSignIn = postSignInScreen.result?.value as { isBlocked: boolean; url: string } | null;
-  if (postSignIn?.isBlocked) {
+  const postSignIn = postSignInScreen.result?.value as { is429001: boolean; is429002: boolean; url: string } | null;
+  if (postSignIn?.is429002) {
+    logger.warn(`[Login] ⚠️  Unauthorised Activity (429002) on reload retry — URL: ${postSignIn.url}`);
+    throw new UnauthorisedActivityError(email);
+  }
+  if (postSignIn?.is429001) {
     logger.warn(`[Login] ⚠️  Account blocked (429001) on reload retry — URL: ${postSignIn.url}`);
     throw new AccountBlockedError(email);
   }

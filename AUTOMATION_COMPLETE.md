@@ -240,3 +240,8 @@ For issues or questions:
 
 *Last updated: May 16, 2026*
 *Version: 1.0.0 (Production)*
+
+
+
+# scripts needed to excecute
+gmail token refresh : npm run tools:gmail-token

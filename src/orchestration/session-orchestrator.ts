@@ -28,8 +28,8 @@ import { logger } from '../utils/logger';
 import { sleep } from '../automation/cdp-helpers';
 import { REMOTE_DEBUG_PORT } from '../auth/browser';
 import { incrementSessionAndCheckRotation, getRotationStatus, forceRotateOnBlock } from '../auth/account-manager';
-import { notifyOwnerAccountBlocked, notifyOwnerOtpTimeout } from '../services/telegram-notifier';
-import { AccountBlockedError, OtpTimeoutError } from '../automation/login-flow';
+import { notifyOwnerAccountBlocked, notifyOwnerOtpTimeout, notifyOwnerUnauthorisedActivity } from '../services/telegram-notifier';
+import { AccountBlockedError, OtpTimeoutError, UnauthorisedActivityError } from '../automation/login-flow';
 
 // ---------------------------------------------------------------------------
 // Timestamp helper — IST [HH:MM:SS]
@@ -362,6 +362,11 @@ async function runSessionWithRetry(
       logger.warn(`[${ts()}] [Orchestrator] ${phase} — OTP timeout, skipping retry`);
       throw err;
     }
+    // Unauthorised activity — no retry, rotate and hand off to caller
+    if (err instanceof UnauthorisedActivityError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — unauthorised activity (429002), skipping retry`);
+      throw err;
+    }
 
     logger.error(
       { err: err.message },
@@ -390,6 +395,11 @@ async function runSessionWithRetry(
     // OTP timeout on retry — rotate and hand off
     if (err instanceof OtpTimeoutError) {
       logger.warn(`[${ts()}] [Orchestrator] ${phase} — OTP timeout on retry`);
+      throw err;
+    }
+    // Unauthorised activity on retry — rotate and hand off
+    if (err instanceof UnauthorisedActivityError) {
+      logger.warn(`[${ts()}] [Orchestrator] ${phase} — unauthorised activity (429002) on retry`);
       throw err;
     }
 
@@ -572,6 +582,32 @@ export async function startOrchestrationLoop(callbacks: OrchestratorCallbacks): 
         logger.info(`[${ts()}] [Orchestrator] PHASE TRANSITION: ${phase} → ${next}`);
 
         // Enter 30-min cooldown (same as account block)
+        await startAccountBlockCooldown();
+        await waitForCooldown();
+
+        logger.info(`[${ts()}] [Orchestrator] NEXT SESSION LAUNCH — ${next} (new account)`);
+        phase = next;
+        continue;
+      }
+
+      // ── Unauthorised activity (429002) ────────────────────────────────────
+      if (err instanceof UnauthorisedActivityError) {
+        const blockedEmail = err.message.replace('UNAUTHORISED_ACTIVITY_429002: ', '');
+        logger.warn(`[${ts()}] [Orchestrator] Unauthorised activity (429002) — force-rotating and entering 30-min cooldown`);
+
+        const nextEmail = await forceRotateOnBlock(blockedEmail);
+
+        // Notify owner via personal DM
+        notifyOwnerUnauthorisedActivity(blockedEmail, nextEmail, ACCOUNT_BLOCK_COOLDOWN_MS / 60000).catch((e) => {
+          logger.warn({ err: e.message }, '[Orchestrator] Owner DM failed — non-fatal');
+        });
+
+        // Transition phase normally
+        const next = nextPhase(phase);
+        await setPhase(next);
+        logger.info(`[${ts()}] [Orchestrator] PHASE TRANSITION: ${phase} → ${next}`);
+
+        // Enter 30-min cooldown
         await startAccountBlockCooldown();
         await waitForCooldown();
 

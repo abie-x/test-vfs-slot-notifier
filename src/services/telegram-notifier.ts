@@ -24,6 +24,12 @@ const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? '';
 const OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID ?? '';
 
+// Topic thread IDs for the supergroup's forum topics
+const TOPIC_FRANCE = process.env.TELEGRAM_TOPIC_FRANCE
+  ? parseInt(process.env.TELEGRAM_TOPIC_FRANCE, 10)
+  : 2;
+// TOPIC_ITALY and TOPIC_GERMANY — coming soon
+
 // ---------------------------------------------------------------------------
 // Deduplication state
 // Tracks the last date we sent a notification for per centre.
@@ -98,12 +104,14 @@ function shortCentreName(fullName: string): string {
  * Sends a plain-text or Markdown message to the configured Telegram group.
  * Never throws — errors are logged and swallowed so polling continues.
  *
- * @param text     Message text (supports Telegram Markdown v1)
+ * @param text       Message text (supports Telegram Markdown v1)
  * @param parseMode  'Markdown' | 'HTML' | undefined (default: undefined = plain text)
+ * @param threadId   Optional topic thread ID for supergroup forum topics
  */
 export async function sendTelegramMessage(
   text: string,
-  parseMode?: 'Markdown' | 'HTML'
+  parseMode?: 'Markdown' | 'HTML',
+  threadId?: number
 ): Promise<boolean> {
   if (!BOT_TOKEN) {
     logger.warn('[Telegram] TELEGRAM_BOT_TOKEN is not set — skipping send');
@@ -118,6 +126,7 @@ export async function sendTelegramMessage(
     chat_id: CHAT_ID,
     text,
     ...(parseMode ? { parse_mode: parseMode } : {}),
+    ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
   });
 
   return new Promise((resolve) => {
@@ -209,15 +218,16 @@ export async function notifyDateChange(
     `🇫🇷 France Appointment Update\n` +
     `\n` +
     `📍 Centre: ${short}\n` +
-    `📅 Previous Date: ${prevFormatted}\n` +
+    `✅ Earlier slot available\n` +
     `✨ New Date: *${newFormatted}*\n` +
+    `📅 Previous Date: ${prevFormatted}\n` +
     `\n` +
     `⏰ ${time} IST\n` +
     `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
 
   logger.info(`[Telegram] Sending date change notification for ${centreName}: ${previousDate} → ${newDate}`);
 
-  const sent = await sendTelegramMessage(message, 'Markdown');
+  const sent = await sendTelegramMessage(message, 'Markdown', TOPIC_FRANCE);
 
   if (sent) {
     // Update deduplication state only on successful send
@@ -269,15 +279,15 @@ export async function notifyLaterDate(
     `\n` +
     `📍 Centre: ${short}\n` +
     `⚠️ Earlier slot taken — date moved out\n` +
-    `📅 Was: ${prevFormatted}\n` +
-    `📅 Now: *${newFormatted}*\n` +
+    `✨ New Date: *${newFormatted}*\n` +
+    `📅 Previous Date: ${prevFormatted}\n` +
     `\n` +
     `⏰ ${time} IST\n` +
     `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
 
   logger.info(`[Telegram] Sending later-date notification for ${centreName}: ${previousDate} → ${newDate}`);
 
-  const sent = await sendTelegramMessage(message, 'Markdown');
+  const sent = await sendTelegramMessage(message, 'Markdown', TOPIC_FRANCE);
 
   if (sent) {
     lastNotifiedDate.set(centreName, newDate);
@@ -411,6 +421,37 @@ export async function notifyOwnerOtpTimeout(
     `⏰ ${time} IST`;
 
   logger.warn(`[Telegram] Sending OTP timeout owner DM for ${timedOutEmail}`);
+  await sendOwnerMessage(message);
+}
+
+/**
+ * Notifies the bot owner (private DM) that VFS returned a 429002
+ * "Access Denied Due to Unauthorised Activity" error during login.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param blockedEmail   The email address that triggered the block
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+export async function notifyOwnerUnauthorisedActivity(
+  blockedEmail: string,
+  nextEmail: string,
+  cooldownMinutes: number
+): Promise<void> {
+  const time = istTime();
+
+  const message =
+    `⛔ *VFS Unauthorised Activity (429002)*\n` +
+    `\n` +
+    `🚫 Blocked: \`${blockedEmail}\`\n` +
+    `✅ Rotated to: \`${nextEmail}\`\n` +
+    `\n` +
+    `⚠️ VFS flagged this session as unauthorised activity\n` +
+    `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+    `⏰ ${time} IST`;
+
+  logger.warn(`[Telegram] Sending unauthorised-activity owner DM for ${blockedEmail}`);
   await sendOwnerMessage(message);
 }
 

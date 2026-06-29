@@ -56,5 +56,5 @@ export declare function selectSubCategory(Runtime: any, optionText: string): Pro
 /**
  * Detect current screen type
  */
-export declare function detectCurrentScreen(Runtime: any): Promise<'login' | 'otp' | 'dashboard' | 'unknown'>;
+export declare function detectCurrentScreen(Runtime: any): Promise<'login' | 'otp' | 'dashboard' | 'blocked_429001' | 'unknown'>;
 //# sourceMappingURL=cdp-helpers.d.ts.map

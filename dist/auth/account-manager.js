@@ -21,6 +21,7 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.getCurrentAccount = getCurrentAccount;
 exports.incrementSessionAndCheckRotation = incrementSessionAndCheckRotation;
 exports.getRotationStatus = getRotationStatus;
+exports.forceRotateOnBlock = forceRotateOnBlock;
 const ioredis_1 = __importDefault(require("ioredis"));
 const logger_1 = require("../utils/logger");
 // ---------------------------------------------------------------------------
@@ -56,28 +57,41 @@ redis.connect().catch(() => {
     // Error already logged by the 'error' event above
 });
 /**
- * Get both account credentials from environment variables.
+ * Wait for Redis connection to be ready (max 3s).
+ * Falls through silently if Redis is unavailable.
+ */
+async function waitForRedisReady() {
+    for (let i = 0; i < 10; i++) {
+        if (redis.status === 'ready')
+            return;
+        await new Promise((r) => setTimeout(r, 300));
+    }
+}
+/**
+ * Get all account credentials from environment variables.
  * Throws if any required variable is missing.
  */
 function getAccountCredentials() {
     const email1 = process.env.VFS_EMAIL_ACCOUNT1;
     const email2 = process.env.VFS_EMAIL_ACCOUNT2;
     const email3 = process.env.VFS_EMAIL_ACCOUNT3;
+    const email4 = process.env.VFS_EMAIL_ACCOUNT4;
     const password = process.env.VFS_PASSWORD;
-    if (!email1 || !email2 || !email3 || !password) {
-        throw new Error('Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, VFS_EMAIL_ACCOUNT3, and VFS_PASSWORD must all be set');
+    if (!email1 || !email2 || !email3 || !email4 || !password) {
+        throw new Error('Missing account credentials: VFS_EMAIL_ACCOUNT1, VFS_EMAIL_ACCOUNT2, VFS_EMAIL_ACCOUNT3, VFS_EMAIL_ACCOUNT4, and VFS_PASSWORD must all be set');
     }
     return [
         { email: email1, password },
         { email: email2, password },
         { email: email3, password },
+        { email: email4, password },
     ];
 }
 // ---------------------------------------------------------------------------
 // State helpers
 // ---------------------------------------------------------------------------
 /**
- * Get current account index (0, 1, or 2).
+ * Get current account index (0, 1, 2, or 3).
  * Defaults to 0 if not set.
  */
 async function getCurrentAccountIndex() {
@@ -85,7 +99,7 @@ async function getCurrentAccountIndex() {
         const raw = await redis.get(REDIS_KEY_CURRENT_INDEX);
         if (raw !== null) {
             const parsed = parseInt(raw, 10);
-            if (parsed >= 0 && parsed <= 2)
+            if (parsed >= 0 && parsed <= 3)
                 return parsed;
         }
     }
@@ -140,9 +154,10 @@ async function setSweepCount(count) {
  * Returns { email, password } for the current account.
  */
 async function getCurrentAccount() {
-    const [account1, account2, account3] = getAccountCredentials();
+    await waitForRedisReady();
+    const accounts = getAccountCredentials();
     const index = await getCurrentAccountIndex();
-    const account = index === 0 ? account1 : index === 1 ? account2 : account3;
+    const account = accounts[index];
     logger_1.logger.info(`[${ts()}] [AccountManager] Using account ${index + 1}: ${account.email}`);
     return account;
 }
@@ -157,13 +172,12 @@ async function incrementSessionAndCheckRotation() {
     const newSweepCount = sweepCount + 1;
     logger_1.logger.info(`[${ts()}] [AccountManager] Session completed — sweep progress: ${newSweepCount}/${SESSIONS_PER_SWEEP}`);
     if (newSweepCount >= SESSIONS_PER_SWEEP) {
-        // Full sweep completed — rotate to next account (0 → 1 → 2 → 0)
+        // Full sweep completed — rotate to next account (0 → 1 → 2 → 3 → 0)
         const currentIndex = await getCurrentAccountIndex();
-        const newIndex = (currentIndex + 1) % 3;
+        const newIndex = (currentIndex + 1) % 4;
         await setCurrentAccountIndex(newIndex);
         await setSweepCount(0);
-        const [account1, account2, account3] = getAccountCredentials();
-        const accounts = [account1, account2, account3];
+        const accounts = getAccountCredentials();
         const newAccount = accounts[newIndex];
         logger_1.logger.info('');
         logger_1.logger.info('═══════════════════════════════════════════════════════');
@@ -184,8 +198,8 @@ async function incrementSessionAndCheckRotation() {
  * Get current rotation status for logging/debugging.
  */
 async function getRotationStatus() {
-    const [account1, account2, account3] = getAccountCredentials();
-    const accounts = [account1, account2, account3];
+    await waitForRedisReady();
+    const accounts = getAccountCredentials();
     const index = await getCurrentAccountIndex();
     const sweepCount = await getSweepCount();
     const currentEmail = accounts[index].email;
@@ -194,5 +208,27 @@ async function getRotationStatus() {
         currentEmail,
         sweepProgress: `${sweepCount}/${SESSIONS_PER_SWEEP} sessions`,
     };
+}
+/**
+ * Force-rotate to the next account immediately when a 429001 block is detected.
+ * Does NOT touch sweep_count — the new account continues from the current sweep
+ * progress and rotates normally after its own full sweep.
+ *
+ * Returns the email of the newly active account.
+ */
+async function forceRotateOnBlock(blockedEmail) {
+    const currentIndex = await getCurrentAccountIndex();
+    const newIndex = (currentIndex + 1) % 4;
+    await setCurrentAccountIndex(newIndex);
+    const accounts = getAccountCredentials();
+    const newAccount = accounts[newIndex];
+    logger_1.logger.warn('');
+    logger_1.logger.warn('═══════════════════════════════════════════════════════');
+    logger_1.logger.warn(`  [${ts()}] [AccountManager] FORCE ROTATION (429001 BLOCK)`);
+    logger_1.logger.warn(`  [${ts()}] [AccountManager] Blocked account: ${blockedEmail}`);
+    logger_1.logger.warn(`  [${ts()}] [AccountManager] Switching: Account ${currentIndex + 1} → Account ${newIndex + 1}`);
+    logger_1.logger.warn(`  [${ts()}] [AccountManager] Next login will use: ${newAccount.email}`);
+    logger_1.logger.warn('═══════════════════════════════════════════════════════');
+    return newAccount.email;
 }
 //# sourceMappingURL=account-manager.js.map

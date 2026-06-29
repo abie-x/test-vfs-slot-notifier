@@ -20,6 +20,9 @@ Object.defineProperty(exports, "__esModule", { value: true });
 exports.sendTelegramMessage = sendTelegramMessage;
 exports.notifyDateChange = notifyDateChange;
 exports.notifyLaterDate = notifyLaterDate;
+exports.notifyOwnerAccountBlocked = notifyOwnerAccountBlocked;
+exports.notifyOwnerOtpTimeout = notifyOwnerOtpTimeout;
+exports.notifyOwnerUnauthorisedActivity = notifyOwnerUnauthorisedActivity;
 exports.testTelegramIntegration = testTelegramIntegration;
 const https_1 = __importDefault(require("https"));
 const logger_1 = require("../utils/logger");
@@ -28,6 +31,12 @@ const logger_1 = require("../utils/logger");
 // ---------------------------------------------------------------------------
 const BOT_TOKEN = process.env.TELEGRAM_BOT_TOKEN ?? '';
 const CHAT_ID = process.env.TELEGRAM_CHAT_ID ?? '';
+const OWNER_CHAT_ID = process.env.TELEGRAM_OWNER_CHAT_ID ?? '';
+// Topic thread IDs for the supergroup's forum topics
+const TOPIC_FRANCE = process.env.TELEGRAM_TOPIC_FRANCE
+    ? parseInt(process.env.TELEGRAM_TOPIC_FRANCE, 10)
+    : 2;
+// TOPIC_ITALY and TOPIC_GERMANY — coming soon
 // ---------------------------------------------------------------------------
 // Deduplication state
 // Tracks the last date we sent a notification for per centre.
@@ -49,37 +58,31 @@ function istTime() {
     });
 }
 /**
- * Formats a raw date string into a readable form like "12 Jun 2026".
+ * Formats a raw date string from VFS API (e.g. "06/20/2026 00:00:00" or "2026-05-27")
+ * into a readable form like "20 Jun 2026".
+ * Displays in IST to avoid timezone-shift off-by-one errors.
  * Falls back to the raw string if parsing fails.
- *
- * Handles two formats from the VFS API:
- *   - "MM/DD/YYYY HH:MM:SS"  e.g. "06/12/2026 00:00:00"
- *   - "YYYY-MM-DD"           e.g. "2026-06-12"
- *
- * Dates are parsed as UTC to avoid timezone shifts (e.g. midnight IST
- * rolling back to the previous day when converted to UTC).
  */
 function formatDate(raw) {
     try {
-        let isoString;
-        // Match "MM/DD/YYYY HH:MM:SS" or "MM/DD/YYYY"
-        const mdyMatch = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
-        if (mdyMatch) {
-            // Reconstruct as an explicit UTC ISO string so Date() never applies local offset
-            isoString = `${mdyMatch[3]}-${mdyMatch[1]}-${mdyMatch[2]}T00:00:00Z`;
+        // VFS returns dates as "MM/DD/YYYY HH:MM:SS" — parse explicitly to avoid
+        // JavaScript's ambiguous date parsing behaviour
+        let d;
+        const mmddyyyy = raw.match(/^(\d{2})\/(\d{2})\/(\d{4})/);
+        if (mmddyyyy) {
+            // Parse as "YYYY-MM-DD" which is unambiguous in JS
+            d = new Date(`${mmddyyyy[3]}-${mmddyyyy[1]}-${mmddyyyy[2]}T00:00:00+05:30`);
         }
         else {
-            // Assume YYYY-MM-DD — append Z to force UTC interpretation
-            isoString = raw.includes('T') ? raw : `${raw.split(' ')[0]}T00:00:00Z`;
+            d = new Date(raw);
         }
-        const d = new Date(isoString);
         if (isNaN(d.getTime()))
             return raw;
         return d.toLocaleDateString('en-GB', {
             day: '2-digit',
             month: 'short',
             year: 'numeric',
-            timeZone: 'UTC',
+            timeZone: 'Asia/Kolkata',
         });
     }
     catch {
@@ -105,10 +108,11 @@ function shortCentreName(fullName) {
  * Sends a plain-text or Markdown message to the configured Telegram group.
  * Never throws — errors are logged and swallowed so polling continues.
  *
- * @param text     Message text (supports Telegram Markdown v1)
+ * @param text       Message text (supports Telegram Markdown v1)
  * @param parseMode  'Markdown' | 'HTML' | undefined (default: undefined = plain text)
+ * @param threadId   Optional topic thread ID for supergroup forum topics
  */
-async function sendTelegramMessage(text, parseMode) {
+async function sendTelegramMessage(text, parseMode, threadId) {
     if (!BOT_TOKEN) {
         logger_1.logger.warn('[Telegram] TELEGRAM_BOT_TOKEN is not set — skipping send');
         return false;
@@ -121,6 +125,7 @@ async function sendTelegramMessage(text, parseMode) {
         chat_id: CHAT_ID,
         text,
         ...(parseMode ? { parse_mode: parseMode } : {}),
+        ...(threadId !== undefined ? { message_thread_id: threadId } : {}),
     });
     return new Promise((resolve) => {
         const options = {
@@ -195,13 +200,13 @@ async function notifyDateChange(centreName, previousDate, newDate) {
     const message = `🇫🇷 France Appointment Update\n` +
         `\n` +
         `📍 Centre: ${short}\n` +
+        `✨ New Date: *${newFormatted}*\n` +
         `📅 Previous Date: ${prevFormatted}\n` +
-        `✨ New Date: ${newFormatted}\n` +
         `\n` +
         `⏰ ${time} IST\n` +
         `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
     logger_1.logger.info(`[Telegram] Sending date change notification for ${centreName}: ${previousDate} → ${newDate}`);
-    const sent = await sendTelegramMessage(message, 'Markdown');
+    const sent = await sendTelegramMessage(message, 'Markdown', TOPIC_FRANCE);
     if (sent) {
         // Update deduplication state only on successful send
         lastNotifiedDate.set(centreName, newDate);
@@ -242,16 +247,143 @@ async function notifyLaterDate(centreName, previousDate, newDate) {
         `\n` +
         `📍 Centre: ${short}\n` +
         `⚠️ Earlier slot taken — date moved out\n` +
-        `📅 Was: ${prevFormatted}\n` +
-        `📅 Now: ${newFormatted}\n` +
+        `✨ New Date: *${newFormatted}*\n` +
+        `📅 Previous Date: ${prevFormatted}\n` +
         `\n` +
         `⏰ ${time} IST\n` +
         `🔗 [Book Now](https://visa.vfsglobal.com/ind/en/fra/login)`;
     logger_1.logger.info(`[Telegram] Sending later-date notification for ${centreName}: ${previousDate} → ${newDate}`);
-    const sent = await sendTelegramMessage(message, 'Markdown');
+    const sent = await sendTelegramMessage(message, 'Markdown', TOPIC_FRANCE);
     if (sent) {
         lastNotifiedDate.set(centreName, newDate);
     }
+}
+// ---------------------------------------------------------------------------
+// Owner DM — private notifications to bot operator only
+// ---------------------------------------------------------------------------
+/**
+ * Sends a message directly to the bot owner's personal Telegram chat.
+ * Uses TELEGRAM_OWNER_CHAT_ID instead of the group TELEGRAM_CHAT_ID.
+ * Never throws.
+ */
+async function sendOwnerMessage(text) {
+    if (!BOT_TOKEN) {
+        logger_1.logger.warn('[Telegram] TELEGRAM_BOT_TOKEN is not set — skipping owner DM');
+        return false;
+    }
+    if (!OWNER_CHAT_ID) {
+        logger_1.logger.warn('[Telegram] TELEGRAM_OWNER_CHAT_ID is not set — skipping owner DM');
+        return false;
+    }
+    const payload = JSON.stringify({
+        chat_id: OWNER_CHAT_ID,
+        text,
+        parse_mode: 'Markdown',
+    });
+    return new Promise((resolve) => {
+        const options = {
+            hostname: 'api.telegram.org',
+            path: `/bot${BOT_TOKEN}/sendMessage`,
+            method: 'POST',
+            headers: {
+                'Content-Type': 'application/json',
+                'Content-Length': Buffer.byteLength(payload),
+            },
+        };
+        const req = https_1.default.request(options, (res) => {
+            let body = '';
+            res.on('data', (chunk) => (body += chunk));
+            res.on('end', () => {
+                if (res.statusCode === 200) {
+                    logger_1.logger.info('[Telegram] ✓ Owner DM sent successfully');
+                    resolve(true);
+                }
+                else {
+                    logger_1.logger.error({ statusCode: res.statusCode, body }, '[Telegram] ✗ Owner DM failed — non-200 response');
+                    resolve(false);
+                }
+            });
+        });
+        req.on('error', (err) => {
+            logger_1.logger.error({ err: err.message }, '[Telegram] ✗ Owner DM failed — network error');
+            resolve(false);
+        });
+        req.setTimeout(10000, () => {
+            logger_1.logger.error('[Telegram] ✗ Owner DM failed — request timed out after 10s');
+            req.destroy();
+            resolve(false);
+        });
+        req.write(payload);
+        req.end();
+    });
+}
+/**
+ * Notifies the bot owner (private DM) that a VFS account has been blocked
+ * with a 429001 "Access Restricted" error.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param blockedEmail   The email address of the blocked account
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+async function notifyOwnerAccountBlocked(blockedEmail, nextEmail, cooldownMinutes) {
+    const time = istTime();
+    const message = `🚫 *VFS Account Blocked (429001)*\n` +
+        `\n` +
+        `⛔ Blocked: \`${blockedEmail}\`\n` +
+        `✅ Rotated to: \`${nextEmail}\`\n` +
+        `\n` +
+        `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+        `⏰ ${time} IST`;
+    logger_1.logger.warn(`[Telegram] Sending account-blocked owner DM for ${blockedEmail}`);
+    await sendOwnerMessage(message);
+}
+/**
+ * Notifies the bot owner (private DM) that OTP was not received after all
+ * retry attempts. Account has been rotated as a precaution.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param timedOutEmail  The email address that did not receive the OTP
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+async function notifyOwnerOtpTimeout(timedOutEmail, nextEmail, cooldownMinutes) {
+    const time = istTime();
+    const message = `⏱️ *OTP Timeout — Account Rotated*\n` +
+        `\n` +
+        `📭 No OTP received for: \`${timedOutEmail}\`\n` +
+        `✅ Rotated to: \`${nextEmail}\`\n` +
+        `\n` +
+        `⚠️ Possible cause: VFS may have flagged this account\n` +
+        `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+        `⏰ ${time} IST`;
+    logger_1.logger.warn(`[Telegram] Sending OTP timeout owner DM for ${timedOutEmail}`);
+    await sendOwnerMessage(message);
+}
+/**
+ * Notifies the bot owner (private DM) that VFS returned a 429002
+ * "Access Denied Due to Unauthorised Activity" error during login.
+ *
+ * Sends to TELEGRAM_OWNER_CHAT_ID — NOT the group chat.
+ *
+ * @param blockedEmail   The email address that triggered the block
+ * @param nextEmail      The email address of the account we rotated to
+ * @param cooldownMinutes How long the bot will wait before retrying (minutes)
+ */
+async function notifyOwnerUnauthorisedActivity(blockedEmail, nextEmail, cooldownMinutes) {
+    const time = istTime();
+    const message = `⛔ *VFS Unauthorised Activity (429002)*\n` +
+        `\n` +
+        `🚫 Blocked: \`${blockedEmail}\`\n` +
+        `✅ Rotated to: \`${nextEmail}\`\n` +
+        `\n` +
+        `⚠️ VFS flagged this session as unauthorised activity\n` +
+        `⏳ Cooldown: ${cooldownMinutes} minutes\n` +
+        `⏰ ${time} IST`;
+    logger_1.logger.warn(`[Telegram] Sending unauthorised-activity owner DM for ${blockedEmail}`);
+    await sendOwnerMessage(message);
 }
 // ---------------------------------------------------------------------------
 // Integration test

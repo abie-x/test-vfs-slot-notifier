@@ -21,9 +21,7 @@ const child_process_1 = require("child_process");
 const path_1 = __importDefault(require("path"));
 const logger_1 = require("../utils/logger");
 exports.POLL_USER_DATA_DIR = path_1.default.resolve(process.cwd(), 'profiles/main-session');
-const CHROME_EXECUTABLE = process.env.CHROME_EXECUTABLE || (process.platform === 'darwin'
-    ? '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome'
-    : '/usr/bin/google-chrome');
+const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
 const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
 // Port 9223 avoids conflict with any existing Chrome instance on 9222
 exports.REMOTE_DEBUG_PORT = 9223;
@@ -45,14 +43,8 @@ async function launchChrome() {
     const proc = (0, child_process_1.spawn)(CHROME_EXECUTABLE, [
         `--user-data-dir=${exports.POLL_USER_DATA_DIR}`,
         `--remote-debugging-port=${exports.REMOTE_DEBUG_PORT}`,
-        '--no-sandbox',
-        '--disable-setuid-sandbox',
         VFS_LOGIN_URL,
-    ], {
-        detached: false,
-        stdio: 'ignore',
-        env: { ...process.env, DISPLAY: process.env.DISPLAY || ':99' },
-    });
+    ], { detached: false, stdio: 'ignore' });
     proc.on('exit', (code, signal) => {
         logger_1.logger.info(`[Browser] Chrome process exited (PID: ${proc.pid}, code: ${code}, signal: ${signal})`);
     });

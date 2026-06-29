@@ -37,5 +37,13 @@ export declare function getRotationStatus(): Promise<{
     currentEmail: string;
     sweepProgress: string;
 }>;
+/**
+ * Force-rotate to the next account immediately when a 429001 block is detected.
+ * Does NOT touch sweep_count — the new account continues from the current sweep
+ * progress and rotates normally after its own full sweep.
+ *
+ * Returns the email of the newly active account.
+ */
+export declare function forceRotateOnBlock(blockedEmail: string): Promise<string>;
 export {};
 //# sourceMappingURL=account-manager.d.ts.map
