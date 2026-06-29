@@ -290,26 +290,56 @@ function nextPhase(current: SessionPhase): SessionPhase {
 /**
  * Kill any process still holding the CDP debug port from a previous crash.
  * Called once at startup before the first session launches.
+ * Uses netstat/taskkill on Windows, lsof on macOS/Linux.
  */
 async function cleanupStaleChrome(): Promise<void> {
   logger.info(`[${ts()}] [Orchestrator] Checking for stale Chrome on port ${REMOTE_DEBUG_PORT}...`);
   try {
-    const output = execSync(`lsof -ti tcp:${REMOTE_DEBUG_PORT} 2>/dev/null || true`, {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
+    let pids: string[] = [];
 
-    if (!output) {
-      logger.info(`[${ts()}] [Orchestrator] ✓ Port ${REMOTE_DEBUG_PORT} is free — no stale Chrome`);
-      return;
+    if (process.platform === 'win32') {
+      // Windows: netstat finds the PID
+      const output = execSync(
+        `netstat -ano | findstr :${REMOTE_DEBUG_PORT}`,
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
+
+      if (!output) {
+        logger.info(`[${ts()}] [Orchestrator] ✓ Port ${REMOTE_DEBUG_PORT} is free — no stale Chrome`);
+        return;
+      }
+
+      const pidSet = new Set<string>();
+      for (const line of output.split('\n')) {
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid) && pid !== '0') pidSet.add(pid);
+      }
+      pids = [...pidSet];
+    } else {
+      // macOS / Linux: lsof
+      const output = execSync(`lsof -ti tcp:${REMOTE_DEBUG_PORT} 2>/dev/null || true`, {
+        encoding: 'utf8',
+        timeout: 5000,
+      }).trim();
+
+      if (!output) {
+        logger.info(`[${ts()}] [Orchestrator] ✓ Port ${REMOTE_DEBUG_PORT} is free — no stale Chrome`);
+        return;
+      }
+
+      pids = output.split('\n').filter(Boolean);
     }
 
-    const pids = output.split('\n').filter(Boolean);
     logger.warn(`[${ts()}] [Orchestrator] Stale process(es) on port ${REMOTE_DEBUG_PORT}: ${pids.join(', ')} — killing`);
 
     for (const pid of pids) {
       try {
-        execSync(`kill -9 ${pid} 2>/dev/null || true`, { timeout: 3000 });
+        if (process.platform === 'win32') {
+          execSync(`taskkill /PID ${pid} /F`, { timeout: 3000 });
+        } else {
+          execSync(`kill -9 ${pid} 2>/dev/null || true`, { timeout: 3000 });
+        }
         logger.info(`[${ts()}] [Orchestrator] Killed stale PID ${pid}`);
       } catch {
         // Already gone
@@ -319,7 +349,7 @@ async function cleanupStaleChrome(): Promise<void> {
     await sleep(1500);
     logger.info(`[${ts()}] [Orchestrator] ✓ Stale Chrome cleanup complete`);
   } catch {
-    logger.info(`[${ts()}] [Orchestrator] Could not check for stale Chrome (lsof unavailable) — continuing`);
+    logger.info(`[${ts()}] [Orchestrator] Could not check for stale Chrome — continuing`);
   }
 }
 

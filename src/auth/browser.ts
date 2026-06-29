@@ -16,7 +16,30 @@ import { logger } from '../utils/logger';
 
 export const POLL_USER_DATA_DIR = path.resolve(process.cwd(), 'profiles/main-session');
 
-const CHROME_EXECUTABLE = '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+/**
+ * Resolve the Chrome executable path.
+ * Priority:
+ *   1. CHROME_EXECUTABLE env var — lets any machine override without code changes
+ *   2. OS-based default:
+ *      - macOS  → /Applications/Google Chrome.app/Contents/MacOS/Google Chrome
+ *      - Windows → C:\Program Files\Google\Chrome\Application\chrome.exe
+ *      - Linux  → /usr/bin/google-chrome (headless server default)
+ */
+function resolveChromePath(): string {
+  if (process.env.CHROME_EXECUTABLE) {
+    return process.env.CHROME_EXECUTABLE;
+  }
+  switch (process.platform) {
+    case 'win32':
+      return 'C:\\Program Files\\Google\\Chrome\\Application\\chrome.exe';
+    case 'darwin':
+      return '/Applications/Google Chrome.app/Contents/MacOS/Google Chrome';
+    default:
+      return '/usr/bin/google-chrome';
+  }
+}
+
+const CHROME_EXECUTABLE = resolveChromePath();
 const VFS_LOGIN_URL = 'https://visa.vfsglobal.com/ind/en/fra/login';
 
 // Port 9223 avoids conflict with any existing Chrome instance on 9222
@@ -132,28 +155,57 @@ export async function shutdownChrome(proc: ChildProcess): Promise<void> {
 
 /**
  * Kill any process still listening on the given port.
- * Uses lsof (available on macOS/Linux). Safe to call even if port is free.
+ * Uses netstat/taskkill on Windows, lsof on macOS/Linux.
+ * Safe to call even if port is free.
  */
 async function killProcessOnPort(port: number): Promise<void> {
   try {
-    const output = execSync(`lsof -ti tcp:${port} 2>/dev/null || true`, {
-      encoding: 'utf8',
-      timeout: 5000,
-    }).trim();
+    if (process.platform === 'win32') {
+      // Windows: netstat finds the PID, taskkill terminates it
+      const output = execSync(
+        `netstat -ano | findstr :${port}`,
+        { encoding: 'utf8', timeout: 5000 }
+      ).trim();
 
-    if (!output) return; // Port is already free
+      if (!output) return;
 
-    const pids = output.split('\n').filter(Boolean);
-    for (const orphanPid of pids) {
-      try {
-        execSync(`kill -9 ${orphanPid} 2>/dev/null || true`, { timeout: 3000 });
-        logger.info(`[Browser] Killed orphan process on port ${port} (PID: ${orphanPid})`);
-      } catch {
-        // Already gone
+      const pids = new Set<string>();
+      for (const line of output.split('\n')) {
+        // Lines look like: TCP  0.0.0.0:9223  0.0.0.0:0  LISTENING  12345
+        const parts = line.trim().split(/\s+/);
+        const pid = parts[parts.length - 1];
+        if (pid && /^\d+$/.test(pid) && pid !== '0') pids.add(pid);
+      }
+
+      for (const pid of pids) {
+        try {
+          execSync(`taskkill /PID ${pid} /F`, { timeout: 3000 });
+          logger.info(`[Browser] Killed orphan process on port ${port} (PID: ${pid})`);
+        } catch {
+          // Already gone
+        }
+      }
+    } else {
+      // macOS / Linux: lsof
+      const output = execSync(`lsof -ti tcp:${port} 2>/dev/null || true`, {
+        encoding: 'utf8',
+        timeout: 5000,
+      }).trim();
+
+      if (!output) return;
+
+      const pids = output.split('\n').filter(Boolean);
+      for (const orphanPid of pids) {
+        try {
+          execSync(`kill -9 ${orphanPid} 2>/dev/null || true`, { timeout: 3000 });
+          logger.info(`[Browser] Killed orphan process on port ${port} (PID: ${orphanPid})`);
+        } catch {
+          // Already gone
+        }
       }
     }
   } catch {
-    // lsof not available or other error — non-fatal
+    // Command unavailable or port already free — non-fatal
   }
 }
 
